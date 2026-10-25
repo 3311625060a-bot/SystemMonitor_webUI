@@ -134,3 +134,17 @@ dist
 .yarn/build-state.yml
 .yarn/install-state.gz
 .pnp.*
+
+# ===== 系统监控 (SystemMonitor_webUI) 专用 =====
+# 构建产物：启动器 exe、便携 Node 缓存、下载缓存
+build/
+# 源码方式自动部署的 Node.js 运行时
+runtime/
+# 安装包输出目录
+dist/
+# 后台服务与启动器日志
+server.log
+server.err.log
+launcher.log
+# 由 installer/make-icon.ps1 自动生成的应用图标
+installer/assets/*.ico

@@ -1,0 +1,13 @@
+{
+  "name": "system-monitor",
+  "version": "1.2.2",
+  "description": "Real-time Windows system performance monitor with zero npm dependencies",
+  "main": "server.js",
+  "type": "module",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "engines": {
+    "node": ">=18"
+  }
+}
