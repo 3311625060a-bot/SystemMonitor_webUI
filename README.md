@@ -243,6 +243,6 @@ A: 使用 `SystemMonitor-Setup-1.2.2.exe /VERYSILENT /SUPPRESSMSGBOXES /NORESTAR
 
 ## 许可证
 
-MIT License，版权归 [金将军的迈巴赫保养员](https://github.com/3311650060a-bot) 所有，全文见 [LICENSE](LICENSE)。
+MIT License，版权归 [金将军的迈巴赫保养员](https://github.com/3311625060a-bot) 所有，全文见 [LICENSE](LICENSE)。
 
-源码仓库：[3311650060a-bot/SystemMonitor_webUI](https://github.com/3311650060a-bot/SystemMonitor_webUI)
+源码仓库：[3311625060a-bot/SystemMonitor_webUI](https://github.com/3311625060a-bot/SystemMonitor_webUI)

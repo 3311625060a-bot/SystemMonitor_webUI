@@ -14,9 +14,9 @@ AppName={#MyAppName}
 AppVersion={#MyAppVersion}
 AppVerName={#MyAppName} {#MyAppVersion}
 AppPublisher={#MyAppPublisher}
-AppPublisherURL=https://github.com/3311650060a-bot
-AppSupportURL=https://github.com/3311650060a-bot/SystemMonitor_webUI/issues
-AppUpdatesURL=https://github.com/3311650060a-bot/SystemMonitor_webUI/releases
+AppPublisherURL=https://github.com/3311625060a-bot
+AppSupportURL=https://github.com/3311625060a-bot/SystemMonitor_webUI/issues
+AppUpdatesURL=https://github.com/3311625060a-bot/SystemMonitor_webUI/releases
 DefaultDirName={localappdata}\Programs\SystemMonitor
 DefaultGroupName={#MyAppName}
 DisableProgramGroupPage=yes
@@ -95,12 +95,12 @@ begin
   if ActiveLanguage = 'chinesesimplified' then
     PublisherInfoText.Caption :=
       '发行商：金将军的迈巴赫保养员' + #13#10 +
-      '项目主页：https://github.com/3311650060a-bot' + #13#10 +
+      '项目主页：https://github.com/3311625060a-bot' + #13#10 +
       '开源协议：MIT License'
   else
     PublisherInfoText.Caption :=
       'Publisher: 金将军的迈巴赫保养员' + #13#10 +
-      'Homepage: https://github.com/3311650060a-bot' + #13#10 +
+      'Homepage: https://github.com/3311625060a-bot' + #13#10 +
       'License: MIT';
 end;
 
