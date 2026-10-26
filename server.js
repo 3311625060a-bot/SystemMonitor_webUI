@@ -1,14 +1,31 @@
 import { createServer } from 'node:http';
 import { spawn, execFile } from 'node:child_process';
 import { readFile } from 'node:fs/promises';
-import { join, extname } from 'node:path';
+import { join, extname, resolve, sep } from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { cpus, totalmem, freemem } from 'node:os';
+import { cpus, totalmem, freemem, networkInterfaces } from 'node:os';
+import { isIP } from 'node:net';
 import { classifyGpuAdapters } from './gpu.js';
 import { startTray, stopTray } from './tray.js';
+import {
+  AuthStore,
+  defaultDataDir,
+  validatePassword,
+  SESSION_TTL_REMEMBER_MS,
+} from './auth.js';
 
 const __dirname = fileURLToPath(new URL('.', import.meta.url));
 const PORT = 3000;
+const PUBLIC_DIR = join(__dirname, 'public');
+const SESSION_COOKIE = 'sm_session';
+const AUTH_DATA_DIR = defaultDataDir();
+
+const auth = new AuthStore(AUTH_DATA_DIR);
+await auth.load();
+
+// 仅当来源是回环地址或本机网卡地址时才视为“本机”。反向代理/内网穿透场景可设置
+// SYSTEM_MONITOR_LOCAL_TRUST=0，让所有请求都必须输入密码。
+const TRUST_LOCAL = !['0', 'false', 'off'].includes(String(process.env.SYSTEM_MONITOR_LOCAL_TRUST || '').toLowerCase());
 
 const MIME = {
   '.html': 'text/html; charset=utf-8',
@@ -439,38 +456,336 @@ function getMetrics() {
   };
 }
 
+// ---------- 访问控制 ----------
+function canonicalAddress(value) {
+  if (!value) return '';
+  let addr = String(value).split('%')[0].toLowerCase();
+  if (addr.startsWith('::ffff:') && isIP(addr.slice(7)) === 4) addr = addr.slice(7);
+  if (isIP(addr) === 6) {
+    try {
+      return new URL(`http://[${addr}]/`).hostname.slice(1, -1).toLowerCase();
+    } catch {
+      return addr;
+    }
+  }
+  return addr;
+}
+
+let ownAddressCache = { at: 0, set: new Set() };
+
+function ownAddresses() {
+  if (Date.now() - ownAddressCache.at < 5000) return ownAddressCache.set;
+  const set = new Set();
+  for (const entries of Object.values(networkInterfaces())) {
+    for (const item of entries || []) {
+      const addr = canonicalAddress(item.address);
+      if (addr) set.add(addr);
+    }
+  }
+  ownAddressCache = { at: Date.now(), set };
+  return set;
+}
+
+function isLocalAddress(req) {
+  const addr = canonicalAddress(req.socket.remoteAddress);
+  if (!addr) return false;
+  if (addr === '::1' || addr.startsWith('127.')) return true;
+  return ownAddresses().has(addr);
+}
+
+// 免密访问受 TRUST_LOCAL 控制；首次设置密码只要求请求来自本机。
+// 这样即使为反代场景设置了 SYSTEM_MONITOR_LOCAL_TRUST=0，本机仍能完成首次初始化。
+function isLocalRequest(req) {
+  return TRUST_LOCAL && isLocalAddress(req);
+}
+
+function parseCookies(header) {
+  const out = {};
+  if (!header) return out;
+  for (const part of String(header).split(';')) {
+    const idx = part.indexOf('=');
+    if (idx < 0) continue;
+    const key = part.slice(0, idx).trim();
+    if (!key) continue;
+    let value = part.slice(idx + 1).trim();
+    try { value = decodeURIComponent(value); } catch {}
+    out[key] = value;
+  }
+  return out;
+}
+
+function sessionToken(req) {
+  return parseCookies(req.headers.cookie)[SESSION_COOKIE] || '';
+}
+
+function sessionCookie(token, persistent) {
+  const maxAge = persistent
+    ? `; Max-Age=${Math.floor(SESSION_TTL_REMEMBER_MS / 1000)}`
+    : '';
+  return `${SESSION_COOKIE}=${token}; Path=/; HttpOnly; SameSite=Lax${maxAge}`;
+}
+
+function clearSessionCookie() {
+  return `${SESSION_COOKIE}=; Path=/; HttpOnly; SameSite=Lax; Max-Age=0`;
+}
+
+function sendJson(res, status, payload, headers = {}) {
+  res.writeHead(status, {
+    'Content-Type': 'application/json; charset=utf-8',
+    'Cache-Control': 'no-store',
+    ...headers,
+  });
+  res.end(JSON.stringify(payload));
+}
+
+function readJsonBody(req, limit = 16 * 1024) {
+  return new Promise((resolvePromise, reject) => {
+    let size = 0;
+    let tooLarge = false;
+    const chunks = [];
+    req.on('data', (chunk) => {
+      if (tooLarge) return;
+      size += chunk.length;
+      if (size > limit) {
+        tooLarge = true;
+        chunks.length = 0;
+        return;
+      }
+      chunks.push(chunk);
+    });
+    req.on('end', () => {
+      if (tooLarge) {
+        const err = new Error('payload_too_large');
+        err.status = 413;
+        reject(err);
+        return;
+      }
+      if (!chunks.length) {
+        resolvePromise({});
+        return;
+      }
+      try {
+        resolvePromise(JSON.parse(Buffer.concat(chunks).toString('utf8')));
+      } catch {
+        const err = new Error('invalid_json');
+        err.status = 400;
+        reject(err);
+      }
+    });
+    req.on('error', reject);
+  });
+}
+
+const LOGIN_MAX_FAILURES = 5;
+const LOGIN_WINDOW_MS = 10 * 60 * 1000;
+const LOGIN_BLOCK_MS = 60 * 1000;
+const loginFailures = new Map();
+
+function loginBlockSeconds(ip) {
+  const rec = loginFailures.get(ip);
+  if (!rec) return 0;
+  const now = Date.now();
+  if (rec.blockedUntil > now) return Math.ceil((rec.blockedUntil - now) / 1000);
+  if (now - rec.firstAt > LOGIN_WINDOW_MS) loginFailures.delete(ip);
+  return 0;
+}
+
+function recordLoginFailure(ip) {
+  const now = Date.now();
+  let rec = loginFailures.get(ip);
+  if (!rec || now - rec.firstAt > LOGIN_WINDOW_MS) {
+    rec = { count: 0, firstAt: now, blockedUntil: 0 };
+  }
+  rec.count += 1;
+  if (rec.count >= LOGIN_MAX_FAILURES) {
+    rec.blockedUntil = now + LOGIN_BLOCK_MS;
+    rec.count = 0;
+    rec.firstAt = now;
+  }
+  loginFailures.set(ip, rec);
+  if (loginFailures.size > 500) {
+    for (const [key, value] of loginFailures) {
+      if (value.blockedUntil < now && now - value.firstAt > LOGIN_WINDOW_MS) {
+        loginFailures.delete(key);
+      }
+    }
+  }
+}
+
+function clearLoginFailures(ip) {
+  loginFailures.delete(ip);
+}
+
+async function handleAuth(req, res, url) {
+  if (url.pathname === '/api/auth/status') {
+    if (req.method !== 'GET') {
+      sendJson(res, 405, { error: 'method_not_allowed' }, { Allow: 'GET' });
+      return true;
+    }
+    const local = isLocalRequest(req);
+    const canSetup = isLocalAddress(req);
+    const hasPassword = auth.hasPassword();
+    const authenticated = hasPassword
+      && (local || !!auth.findSession(sessionToken(req)));
+    sendJson(res, 200, {
+      local,
+      canSetup,
+      localTrust: TRUST_LOCAL,
+      hasPassword,
+      needsSetup: !hasPassword,
+      authenticated,
+    });
+    return true;
+  }
+
+  if (url.pathname === '/api/auth/setup') {
+    if (req.method !== 'POST') {
+      sendJson(res, 405, { error: 'method_not_allowed' }, { Allow: 'POST' });
+      return true;
+    }
+    if (!isLocalAddress(req)) {
+      sendJson(res, 403, { error: 'local_only' });
+      return true;
+    }
+    if (auth.hasPassword()) {
+      sendJson(res, 409, { error: 'already_configured' });
+      return true;
+    }
+
+    let body;
+    try {
+      body = await readJsonBody(req);
+    } catch (err) {
+      sendJson(res, err.status || 400, { error: err.message });
+      return true;
+    }
+    if (!validatePassword(body.password)) {
+      sendJson(res, 400, { error: 'weak_password' });
+      return true;
+    }
+
+    await auth.setPassword(body.password);
+    const remember = !!body.remember;
+    const token = await auth.createSession({ persistent: remember });
+    console.log('Access password configured');
+    sendJson(res, 201, { ok: true }, { 'Set-Cookie': sessionCookie(token, remember) });
+    return true;
+  }
+
+  if (url.pathname === '/api/auth/login') {
+    if (req.method !== 'POST') {
+      sendJson(res, 405, { error: 'method_not_allowed' }, { Allow: 'POST' });
+      return true;
+    }
+    if (!auth.hasPassword()) {
+      sendJson(res, 409, { error: 'setup_required' });
+      return true;
+    }
+
+    const ip = canonicalAddress(req.socket.remoteAddress) || 'unknown';
+    const blocked = loginBlockSeconds(ip);
+    if (blocked > 0) {
+      sendJson(res, 429, { error: 'too_many_attempts', retryAfter: blocked }, {
+        'Retry-After': String(blocked),
+      });
+      return true;
+    }
+
+    let body;
+    try {
+      body = await readJsonBody(req);
+    } catch (err) {
+      sendJson(res, err.status || 400, { error: err.message });
+      return true;
+    }
+    if (typeof body.password !== 'string') {
+      sendJson(res, 400, { error: 'invalid_request' });
+      return true;
+    }
+
+    const valid = await auth.verifyPassword(body.password);
+    if (!valid) {
+      recordLoginFailure(ip);
+      sendJson(res, 401, { error: 'invalid_password' });
+      return true;
+    }
+
+    clearLoginFailures(ip);
+    const remember = !!body.remember;
+    const token = await auth.createSession({ persistent: remember });
+    sendJson(res, 200, { ok: true }, { 'Set-Cookie': sessionCookie(token, remember) });
+    return true;
+  }
+
+  if (url.pathname === '/api/auth/logout') {
+    if (req.method !== 'POST') {
+      sendJson(res, 405, { error: 'method_not_allowed' }, { Allow: 'POST' });
+      return true;
+    }
+    await auth.deleteSession(sessionToken(req));
+    sendJson(res, 200, { ok: true }, { 'Set-Cookie': clearSessionCookie() });
+    return true;
+  }
+
+  sendJson(res, 404, { error: 'not_found' });
+  return true;
+}
+
 async function handleApi(req, res) {
   const url = new URL(req.url, 'http://localhost');
 
+  if (url.pathname.startsWith('/api/auth/')) {
+    return handleAuth(req, res, url);
+  }
+
+  if (!auth.hasPassword()) {
+    sendJson(res, 403, { error: 'setup_required' });
+    return true;
+  }
+  if (!isLocalRequest(req) && !auth.findSession(sessionToken(req))) {
+    sendJson(res, 401, { error: 'unauthorized' });
+    return true;
+  }
+
   if (url.pathname === '/api/system-info') {
     const data = await getSystemInfo();
-    res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8' });
-    res.end(JSON.stringify(data));
+    sendJson(res, 200, data);
     return true;
   }
   if (url.pathname === '/api/metrics') {
     touchGpuSampler();
-    res.writeHead(200, {
-      'Content-Type': 'application/json; charset=utf-8',
-      'Cache-Control': 'no-store',
-    });
-    res.end(JSON.stringify(getMetrics()));
+    sendJson(res, 200, getMetrics());
     return true;
   }
   return false;
 }
 
 async function handleStatic(req, res) {
-  let urlPath = req.url.split('?')[0];
+  if (req.method !== 'GET' && req.method !== 'HEAD') return false;
+
+  let urlPath;
+  try {
+    urlPath = decodeURIComponent(req.url.split('?')[0]);
+  } catch {
+    return false;
+  }
   if (urlPath === '/') urlPath = '/index.html';
-  const filePath = join(__dirname, 'public', urlPath);
+  if (urlPath.includes('\0')) return false;
+
+  // 解析后再校验目录归属，防止 ../ 或编码后的反斜杠越出 public 目录。
+  const filePath = resolve(PUBLIC_DIR, '.' + urlPath);
+  if (!filePath.startsWith(PUBLIC_DIR + sep)) return false;
+
   const ext = extname(filePath);
   if (!MIME[ext]) return false;
 
   try {
     const content = await readFile(filePath);
-    res.writeHead(200, { 'Content-Type': MIME[ext] });
-    res.end(content);
+    res.writeHead(200, {
+      'Content-Type': MIME[ext],
+      'Cache-Control': ext === '.js' || ext === '.css' || ext === '.html' ? 'no-cache' : 'public, max-age=86400',
+    });
+    res.end(req.method === 'HEAD' ? undefined : content);
     return true;
   } catch {
     return false;
@@ -479,6 +794,10 @@ async function handleStatic(req, res) {
 
 const server = createServer(async (req, res) => {
   try {
+    res.setHeader('X-Content-Type-Options', 'nosniff');
+    res.setHeader('X-Frame-Options', 'DENY');
+    res.setHeader('Referrer-Policy', 'no-referrer');
+
     if (req.url.startsWith('/api/')) {
       const handled = await handleApi(req, res);
       if (!handled) {
@@ -504,6 +823,9 @@ function onListening() {
   server.removeListener('error', onListenError);
   server.on('error', (err) => console.error('Server error:', err));
   console.log(`System monitor running at http://localhost:${PORT} (listening on ${listenHost === '::' ? '[::]' : listenHost})`);
+  console.log(auth.hasPassword()
+    ? `Access control: password configured (${TRUST_LOCAL ? 'local access is trusted' : 'local trust disabled'})`
+    : 'Access control: waiting for first local password setup');
   startSampler();
   // 启动即预热一次 GPU 采集，页面打开时就能直接看到全部显卡。
   touchGpuSampler();

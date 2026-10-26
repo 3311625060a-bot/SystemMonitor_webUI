@@ -22,7 +22,7 @@
 <body>
   <header class="topbar">
     <div class="brand">
-      <span class="dot pulse"></span>
+      <span class="dot pulse" id="brand-dot"></span>
       <h1 data-i18n="title">系统监控</h1>
       <span id="hostname" class="host"></span>
     </div>
@@ -41,6 +41,51 @@
       </button>
     </div>
   </header>
+
+  <div id="auth-gate" class="auth-gate" hidden>
+    <div class="auth-card" role="dialog" aria-modal="true" aria-labelledby="auth-title">
+      <div class="auth-mark" aria-hidden="true">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">
+          <rect x="4.5" y="10" width="15" height="10.5" rx="2.6"></rect>
+          <path d="M8.2 10V7.8a3.8 3.8 0 0 1 7.6 0V10"></path>
+          <circle cx="12" cy="15.2" r="1.15" fill="currentColor" stroke="none"></circle>
+        </svg>
+      </div>
+      <h2 id="auth-title" class="auth-title"></h2>
+      <p id="auth-subtitle" class="auth-subtitle"></p>
+      <form id="auth-form" novalidate>
+        <div class="auth-field">
+          <label for="auth-password" data-i18n="password">密码</label>
+          <div class="auth-input">
+            <input id="auth-password" type="password" autocomplete="current-password" spellcheck="false" required />
+            <button type="button" class="auth-eye" id="auth-eye" aria-pressed="false" aria-label="显示密码" title="显示密码">
+              <svg class="eye-open" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                <path d="M2.2 12S5.8 6 12 6s9.8 6 9.8 6-3.6 6-9.8 6-9.8-6-9.8-6Z"></path>
+                <circle cx="12" cy="12" r="2.9"></circle>
+              </svg>
+              <svg class="eye-off" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                <path d="M2.2 12S5.8 6 12 6s9.8 6 9.8 6-3.6 6-9.8 6-9.8-6-9.8-6Z"></path>
+                <circle cx="12" cy="12" r="2.9"></circle>
+                <path d="M3.5 3.5l17 17"></path>
+              </svg>
+            </button>
+          </div>
+        </div>
+        <div class="auth-field" id="auth-confirm-field" hidden>
+          <label for="auth-confirm" data-i18n="confirmPassword">确认密码</label>
+          <input id="auth-confirm" type="password" autocomplete="new-password" spellcheck="false" />
+        </div>
+        <p class="auth-hint" id="auth-hint" data-i18n="passwordHint">至少 8 个字符</p>
+        <label class="auth-remember" id="auth-remember-row">
+          <input type="checkbox" id="auth-remember" />
+          <span data-i18n="remember">自动登录</span>
+        </label>
+        <p class="auth-error" id="auth-error" role="alert" aria-live="polite" hidden></p>
+        <button type="submit" class="auth-submit" id="auth-submit"></button>
+      </form>
+      <p class="auth-note" id="auth-note"></p>
+    </div>
+  </div>
 
   <main class="grid">
     <section class="card sysinfo">
@@ -154,6 +199,12 @@
       </div>
     </section>
   </main>
+
+  <div id="conn-banner" class="conn-banner" hidden role="status" aria-live="polite">
+    <span class="conn-dot" aria-hidden="true"></span>
+    <span class="conn-text" data-i18n="connLost">连接已断开</span>
+    <button type="button" class="conn-retry" id="conn-retry" data-i18n="retry">重试</button>
+  </div>
 
   <footer class="footer">
     <span id="status" class="muted small" data-i18n="connecting">连接中...</span>

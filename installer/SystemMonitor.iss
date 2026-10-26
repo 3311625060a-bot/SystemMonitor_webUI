@@ -1,6 +1,6 @@
 ﻿#define MyAppName "系统监控"
 #ifndef MyAppVersion
-  #define MyAppVersion "1.2.2"
+  #define MyAppVersion "1.3.0"
 #endif
 #ifndef MyArchitecture
   #define MyArchitecture "x64compatible"
@@ -55,6 +55,7 @@ Name: "desktopicon"; Description: "{cm:CreateDesktopIcon}"; GroupDescription: "{
 [Files]
 Source: "..\build\{#MyAppExeName}"; DestDir: "{app}"; Flags: ignoreversion
 Source: "..\server.js"; DestDir: "{app}"; Flags: ignoreversion
+Source: "..\auth.js"; DestDir: "{app}"; Flags: ignoreversion
 Source: "..\gpu.js"; DestDir: "{app}"; Flags: ignoreversion
 Source: "..\tray.js"; DestDir: "{app}"; Flags: ignoreversion
 Source: "..\tray.ps1"; DestDir: "{app}"; Flags: ignoreversion
@@ -79,6 +80,7 @@ Filename: "{app}\{#MyAppExeName}"; Parameters: "--stop"; Flags: runhidden waitun
 Type: files; Name: "{app}\server.log"
 Type: files; Name: "{app}\server.err.log"
 Type: files; Name: "{app}\launcher.log"
+Type: filesandordirs; Name: "{localappdata}\SystemMonitor"
 
 [Code]
 procedure InitializeWizard();

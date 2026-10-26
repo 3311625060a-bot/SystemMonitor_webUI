@@ -23,6 +23,14 @@ try {
   if (RANGES.includes(saved)) rangeSec = saved;
 } catch (e) {}
 
+let authMode = null;
+let authBusy = false;
+let authErrorKey = '';
+let authLocalTrust = true;
+let appStarted = false;
+let connFailures = 0;
+let retryBusy = false;
+
 const I18N = {
   zh: {
     title: '系统监控',
@@ -66,6 +74,38 @@ const I18N = {
     notDetected: '未检测到',
     liveAt: '实时 · 更新于',
     disconnected: '连接断开：',
+    connLost: '连接已断开',
+    retry: '重试',
+    retrying: '重试中…',
+    password: '密码',
+    confirmPassword: '确认密码',
+    passwordHint: '至少 8 个字符',
+    remember: '自动登录',
+    showPassword: '显示密码',
+    hidePassword: '隐藏密码',
+    authSetupTitle: '设置访问密码',
+    authSetupSubtitle: '首次使用请设置访问密码，其他设备访问时需要输入。',
+    authSetupSubtitleNoTrust: '首次使用请设置访问密码，设置后本机与其他设备都需要登录。',
+    authLoginTitle: '访问验证',
+    authLoginSubtitle: '此设备不是主机本机，请输入访问密码。',
+    authLoginSubtitleNoTrust: '请输入访问密码以继续。',
+    authBlockedTitle: '尚未设置密码',
+    authBlockedSubtitle: '请在主机本机上打开此页面，完成首次密码设置。',
+    authLocalNote: '本机访问将保持免密，无需再次输入。',
+    authLocalNoteNoTrust: '本机免密已关闭，设置后本机访问也需要登录。',
+    authBlockedNote: '设置完成后刷新此页面即可登录。',
+    authSetupAction: '设置并进入',
+    authLoginAction: '登录',
+    authWorking: '请稍候…',
+    errWeakPassword: '密码至少需要 8 个字符',
+    errPasswordMismatch: '两次输入的密码不一致',
+    errWrongPassword: '密码错误，请重新输入',
+    errTooMany: '尝试次数过多，请稍后再试',
+    errSetupRequired: '主机尚未设置访问密码，请先在主机上完成设置',
+    errSessionExpired: '登录已过期，请重新登录',
+    errNetwork: '无法连接到服务，请稍后再试',
+    errLocalOnly: '密码只能在本机上设置',
+    errAlreadyConfigured: '密码已设置，请直接登录',
     gpuDiscrete: '独立显卡',
     gpuIntegrated: '核显',
     gpuGeneric: '显卡',
@@ -117,6 +157,38 @@ const I18N = {
     notDetected: 'Not detected',
     liveAt: 'Live · updated at',
     disconnected: 'Disconnected: ',
+    connLost: 'Connection lost',
+    retry: 'Retry',
+    retrying: 'Retrying…',
+    password: 'Password',
+    confirmPassword: 'Confirm password',
+    passwordHint: 'At least 8 characters',
+    remember: 'Keep me signed in',
+    showPassword: 'Show password',
+    hidePassword: 'Hide password',
+    authSetupTitle: 'Set access password',
+    authSetupSubtitle: 'Set a password for access from other devices. Local access stays password-free.',
+    authSetupSubtitleNoTrust: 'Set the access password. This host will also require it because local trust is disabled.',
+    authLoginTitle: 'Access verification',
+    authLoginSubtitle: 'This device is not the host. Enter the access password to continue.',
+    authLoginSubtitleNoTrust: 'Enter the access password to continue.',
+    authBlockedTitle: 'Password not set',
+    authBlockedSubtitle: 'Open this page on the host machine to set the access password first.',
+    authLocalNote: 'Local access will stay password-free.',
+    authLocalNoteNoTrust: 'Local trust is disabled, so this host will ask for the password too.',
+    authBlockedNote: 'Refresh this page after setup to sign in.',
+    authSetupAction: 'Set and continue',
+    authLoginAction: 'Sign in',
+    authWorking: 'Please wait…',
+    errWeakPassword: 'Password must be at least 8 characters',
+    errPasswordMismatch: 'Passwords do not match',
+    errWrongPassword: 'Wrong password, try again',
+    errTooMany: 'Too many attempts, try again later',
+    errSetupRequired: 'The host has not set an access password yet',
+    errSessionExpired: 'Session expired, please sign in again',
+    errNetwork: 'Cannot reach the service, try again later',
+    errLocalOnly: 'The password can only be set on the host machine',
+    errAlreadyConfigured: 'Password already set, please sign in',
     gpuDiscrete: 'Discrete GPU',
     gpuIntegrated: 'Integrated GPU',
     gpuGeneric: 'GPU',
@@ -381,10 +453,255 @@ function applyLanguage(refresh = true) {
   lastGpuHtml = null;
   lastPowerHtml = null;
   updateGpuList(lastGpus);
-  if (refresh) {
+  if (refresh && appStarted) {
     loadSystemInfo();
     tick();
   }
+  if (authMode) renderAuthGate();
+}
+
+// ---------- 访问验证 ----------
+function authElements() {
+  return {
+    gate: document.getElementById('auth-gate'),
+    title: document.getElementById('auth-title'),
+    subtitle: document.getElementById('auth-subtitle'),
+    form: document.getElementById('auth-form'),
+    password: document.getElementById('auth-password'),
+    confirm: document.getElementById('auth-confirm'),
+    confirmField: document.getElementById('auth-confirm-field'),
+    hint: document.getElementById('auth-hint'),
+    rememberRow: document.getElementById('auth-remember-row'),
+    remember: document.getElementById('auth-remember'),
+    error: document.getElementById('auth-error'),
+    submit: document.getElementById('auth-submit'),
+    note: document.getElementById('auth-note'),
+    eye: document.getElementById('auth-eye'),
+  };
+}
+
+function updateEyeLabel() {
+  const els = authElements();
+  if (!els.eye || !els.password) return;
+  const revealed = els.password.type === 'text';
+  const label = revealed ? t('hidePassword') : t('showPassword');
+  els.eye.setAttribute('aria-pressed', String(revealed));
+  els.eye.setAttribute('aria-label', label);
+  els.eye.title = label;
+}
+
+function renderAuthGate() {
+  if (!authMode) return;
+  const els = authElements();
+  if (!els.gate) return;
+
+  const setup = authMode === 'setup';
+  const blocked = authMode === 'blocked';
+  els.title.textContent = t(setup ? 'authSetupTitle' : blocked ? 'authBlockedTitle' : 'authLoginTitle');
+  els.subtitle.textContent = t(setup
+    ? (authLocalTrust ? 'authSetupSubtitle' : 'authSetupSubtitleNoTrust')
+    : blocked
+      ? 'authBlockedSubtitle'
+      : (authLocalTrust ? 'authLoginSubtitle' : 'authLoginSubtitleNoTrust'));
+  els.form.hidden = blocked;
+  els.confirmField.hidden = !setup;
+  els.rememberRow.hidden = authMode !== 'login';
+  els.hint.hidden = !setup;
+  els.note.hidden = authMode === 'login';
+  els.note.textContent = setup
+    ? t(authLocalTrust ? 'authLocalNote' : 'authLocalNoteNoTrust')
+    : blocked ? t('authBlockedNote') : '';
+  els.password.setAttribute('autocomplete', setup ? 'new-password' : 'current-password');
+  els.submit.disabled = authBusy;
+  els.submit.textContent = authBusy
+    ? t('authWorking')
+    : t(setup ? 'authSetupAction' : 'authLoginAction');
+
+  if (authErrorKey) {
+    els.error.textContent = t(authErrorKey);
+    els.error.hidden = false;
+  } else {
+    els.error.hidden = true;
+  }
+  updateEyeLabel();
+}
+
+function openAuthGate(mode, { error = '' } = {}) {
+  const els = authElements();
+  authMode = mode;
+  authErrorKey = error;
+  authBusy = false;
+  appStarted = false;
+  connFailures = 0;
+  stopPolling();
+  hideConnBanner();
+
+  if (!els.gate) return;
+  els.gate.hidden = false;
+  document.body.classList.add('auth-locked');
+  document.querySelector('main')?.setAttribute('inert', '');
+  document.querySelector('footer')?.setAttribute('inert', '');
+  document.querySelector('.topbar')?.classList.add('locked');
+  els.password.value = '';
+  els.password.type = 'password';
+  els.confirm.value = '';
+  els.confirm.type = 'password';
+  els.remember.checked = false;
+  els.eye.classList.remove('revealed');
+  renderAuthGate();
+  if (mode !== 'blocked') {
+    requestAnimationFrame(() => els.password.focus());
+  }
+}
+
+function finishAuth() {
+  const els = authElements();
+  authBusy = false;
+  authMode = null;
+  authErrorKey = '';
+  els.gate.hidden = true;
+  document.body.classList.remove('auth-locked');
+  document.querySelector('main')?.removeAttribute('inert');
+  document.querySelector('footer')?.removeAttribute('inert');
+  document.querySelector('.topbar')?.classList.remove('locked');
+  els.password.value = '';
+  els.password.type = 'password';
+  els.confirm.value = '';
+  els.confirm.type = 'password';
+  els.remember.checked = false;
+  els.eye.classList.remove('revealed');
+  startApp();
+}
+
+function startApp() {
+  if (appStarted) return;
+  appStarted = true;
+  const status = document.getElementById('status');
+  if (status) status.textContent = t('connecting');
+  loadSystemInfo();
+  if (!document.hidden) startPolling();
+}
+
+async function initAuthGate() {
+  try {
+    const r = await fetch('/api/auth/status', { cache: 'no-store' });
+    if (!r.ok) throw new Error('HTTP ' + r.status);
+    const status = await r.json();
+    authLocalTrust = status.localTrust !== false;
+    if (status.needsSetup) {
+      const canSetup = status.canSetup !== undefined ? status.canSetup : status.local;
+      openAuthGate(canSetup ? 'setup' : 'blocked');
+      return;
+    }
+    if (status.authenticated) {
+      startApp();
+      return;
+    }
+    openAuthGate('login');
+  } catch (e) {
+    openAuthGate('login', { error: 'errNetwork' });
+  }
+}
+
+function handleAuthLost(kind) {
+  stopPolling();
+  appStarted = false;
+  connFailures = 0;
+  hideConnBanner();
+  if (kind === 'setup') {
+    initAuthGate();
+  } else {
+    openAuthGate('login', { error: 'errSessionExpired' });
+  }
+}
+
+function authErrorKeyFor(data) {
+  return ({
+    weak_password: 'errWeakPassword',
+    invalid_password: 'errWrongPassword',
+    too_many_attempts: 'errTooMany',
+    local_only: 'errLocalOnly',
+    invalid_request: 'errWrongPassword',
+  })[data && data.error] || 'errNetwork';
+}
+
+async function onAuthSubmit(event) {
+  event.preventDefault();
+  if (!authMode || authBusy || authMode === 'blocked') return;
+
+  const els = authElements();
+  const setup = authMode === 'setup';
+  const password = els.password.value;
+  if (setup) {
+    if (password.length < 8) {
+      authErrorKey = 'errWeakPassword';
+      renderAuthGate();
+      return;
+    }
+    if (password !== els.confirm.value) {
+      authErrorKey = 'errPasswordMismatch';
+      renderAuthGate();
+      return;
+    }
+  } else if (!password) {
+    authErrorKey = 'errWrongPassword';
+    renderAuthGate();
+    return;
+  }
+
+  authBusy = true;
+  authErrorKey = '';
+  renderAuthGate();
+  try {
+    const r = await fetch(setup ? '/api/auth/setup' : '/api/auth/login', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        password,
+        remember: setup ? false : !!els.remember.checked,
+      }),
+    });
+    const data = await r.json().catch(() => ({}));
+    if (r.ok) {
+      finishAuth();
+      return;
+    }
+    if (data.error === 'setup_required') {
+      await initAuthGate();
+      return;
+    }
+    if (setup && data.error === 'already_configured') {
+      openAuthGate('login', { error: 'errAlreadyConfigured' });
+      return;
+    }
+    authErrorKey = authErrorKeyFor(data);
+  } catch (e) {
+    authErrorKey = 'errNetwork';
+  } finally {
+    authBusy = false;
+    if (authMode) renderAuthGate();
+  }
+}
+
+function bindAuthEvents() {
+  const els = authElements();
+  if (!els.gate) return;
+  els.form.addEventListener('submit', onAuthSubmit);
+  for (const input of [els.password, els.confirm]) {
+    input.addEventListener('input', () => {
+      if (!authErrorKey) return;
+      authErrorKey = '';
+      renderAuthGate();
+    });
+  }
+  els.eye.addEventListener('click', () => {
+    const reveal = els.password.type === 'password';
+    els.password.type = reveal ? 'text' : 'password';
+    els.confirm.type = reveal ? 'text' : 'password';
+    els.eye.classList.toggle('revealed', reveal);
+    updateEyeLabel();
+    els.password.focus();
+  });
 }
 
 function pushHistory(ts, cpu, mem, gpu, gpu2, vram) {
@@ -661,13 +978,68 @@ function updatePower(power) {
   el.innerHTML = html;
 }
 
-let ticking = false;
+let pollTimer = null;
+let tickPromise = null;
 
-async function tick() {
-  if (ticking) return;
-  ticking = true;
+function showConnBanner() {
+  const banner = document.getElementById('conn-banner');
+  if (banner) banner.hidden = false;
+  const topbar = document.querySelector('.topbar');
+  if (topbar) topbar.classList.add('offline');
+}
+
+function hideConnBanner() {
+  const banner = document.getElementById('conn-banner');
+  if (banner) {
+    banner.hidden = true;
+    banner.classList.remove('retrying');
+  }
+  const topbar = document.querySelector('.topbar');
+  if (topbar) topbar.classList.remove('offline');
+  const button = document.getElementById('conn-retry');
+  if (button) {
+    button.disabled = false;
+    button.textContent = t('retry');
+  }
+}
+
+function handleTickSuccess() {
+  connFailures = 0;
+  hideConnBanner();
+  const status = document.getElementById('status');
+  if (status) status.textContent = `${t('liveAt')} ${formatTime(new Date())}`;
+}
+
+function handleTickFailure() {
+  connFailures += 1;
+  const status = document.getElementById('status');
+  if (status) status.textContent = t('connLost');
+  if (appStarted && connFailures >= 2) showConnBanner();
+}
+
+function tick() {
+  if (tickPromise) return tickPromise;
+  tickPromise = doTick().finally(() => { tickPromise = null; });
+  return tickPromise;
+}
+
+async function doTick() {
+  if (!appStarted) return false;
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), 4500);
   try {
-    const r = await fetch('/api/metrics', { cache: 'no-store' });
+    const r = await fetch('/api/metrics', { cache: 'no-store', signal: controller.signal });
+    if (r.status === 401) {
+      handleAuthLost('login');
+      return false;
+    }
+    if (r.status === 403) {
+      const data = await r.json().catch(() => ({}));
+      if (data.error === 'setup_required') {
+        handleAuthLost('setup');
+        return false;
+      }
+    }
     if (!r.ok) throw new Error('HTTP ' + r.status);
     const m = await r.json();
 
@@ -717,16 +1089,36 @@ async function tick() {
       vramPct
     );
 
-    document.getElementById('status').textContent =
-      `${t('liveAt')} ${formatTime(new Date())}`;
+    handleTickSuccess();
+    return true;
   } catch (e) {
-    document.getElementById('status').textContent = `${t('disconnected')}${e.message}`;
+    handleTickFailure();
+    return false;
   } finally {
-    ticking = false;
+    clearTimeout(timeout);
   }
 }
 
-let pollTimer = null;
+async function retryConnection() {
+  if (retryBusy || !appStarted) return;
+  retryBusy = true;
+  const banner = document.getElementById('conn-banner');
+  const button = document.getElementById('conn-retry');
+  if (banner) banner.classList.add('retrying');
+  if (button) {
+    button.disabled = true;
+    button.textContent = t('retrying');
+  }
+
+  await tick();
+
+  retryBusy = false;
+  if (button) {
+    button.disabled = false;
+    button.textContent = t('retry');
+  }
+  if (banner) banner.classList.remove('retrying');
+}
 
 function startPolling() {
   if (pollTimer) return;
@@ -787,11 +1179,15 @@ window.addEventListener('DOMContentLoaded', async () => {
     });
   }
 
-  await loadSystemInfo();
-  if (!document.hidden) startPolling();
+  const connRetry = document.getElementById('conn-retry');
+  if (connRetry) connRetry.addEventListener('click', retryConnection);
+
+  bindAuthEvents();
+  await initAuthGate();
 });
 
 document.addEventListener('visibilitychange', () => {
+  if (!appStarted) return;
   if (document.hidden) stopPolling();
   else startPolling();
 });
