@@ -65,6 +65,8 @@ const I18N = {
     sharedMem: '共享内存',
     vram: '显存',
     temp: '温度',
+    powerDraw: '功耗',
+    clock: '频率',
     state: '状态',
     batteryLevel: '电量',
     charging: '充电中',
@@ -114,6 +116,7 @@ const I18N = {
     seriesCpu: 'CPU %',
     seriesMem: '内存 %',
     seriesVram: '显存 %',
+    seriesCpuPower: 'CPU W',
   },
   en: {
     title: 'System Monitor',
@@ -148,6 +151,8 @@ const I18N = {
     sharedMem: 'Shared',
     vram: 'VRAM',
     temp: 'Temp',
+    powerDraw: 'Power',
+    clock: 'Clock',
     state: 'Status',
     batteryLevel: 'Battery',
     charging: 'Charging',
@@ -197,6 +202,7 @@ const I18N = {
     seriesCpu: 'CPU %',
     seriesMem: 'Memory %',
     seriesVram: 'VRAM %',
+    seriesCpuPower: 'CPU W',
   },
 };
 
@@ -252,6 +258,8 @@ const history = {
   gpu: [],
   gpu2: [],
   vram: [],
+  cpuPower: [],
+  gpuPower: [],
 };
 
 let chart = null;
@@ -327,6 +335,34 @@ function initChart() {
           hidden: true,
           available: false,
         },
+        {
+          label: t('seriesCpuPower'),
+          data: [],
+          borderColor: '#ef4444',
+          backgroundColor: 'transparent',
+          borderDash: [5, 3],
+          tension: 0.35,
+          fill: false,
+          borderWidth: 1.8,
+          pointRadius: 0,
+          yAxisID: 'power',
+          hidden: true,
+          available: false,
+        },
+        {
+          label: `${t('gpuGeneric')} W`,
+          data: [],
+          borderColor: '#f97316',
+          backgroundColor: 'transparent',
+          borderDash: [5, 3],
+          tension: 0.35,
+          fill: false,
+          borderWidth: 1.8,
+          pointRadius: 0,
+          yAxisID: 'power',
+          hidden: true,
+          available: false,
+        },
       ],
     },
     options: {
@@ -360,6 +396,9 @@ function initChart() {
           boxWidth: 8,
           boxHeight: 8,
           usePointStyle: true,
+          callbacks: {
+            label: (item) => `${item.dataset.label}: ${Number(item.parsed.y).toFixed(1)}`,
+          },
         },
       },
       scales: {
@@ -374,6 +413,19 @@ function initChart() {
           border: { display: false },
           ticks: { color: c.tick, stepSize: 25, font: { size: 11 }, callback: (v) => v + '%' },
           grid: { color: c.grid },
+        },
+        power: {
+          display: false,
+          position: 'right',
+          min: 0,
+          border: { display: false },
+          ticks: {
+            color: c.tick,
+            maxTicksLimit: 5,
+            font: { size: 11 },
+            callback: (v) => v + 'W',
+          },
+          grid: { drawOnChartArea: false },
         },
       },
     },
@@ -392,6 +444,7 @@ function applyChartTheme() {
   opts.scales.x.ticks.color = c.tick;
   opts.scales.y.ticks.color = c.tick;
   opts.scales.y.grid.color = c.grid;
+  if (opts.scales.power) opts.scales.power.ticks.color = c.tick;
   chart.update('none');
 }
 
@@ -446,7 +499,7 @@ function applyLanguage(refresh = true) {
     chart.data.datasets[0].label = t('seriesCpu');
     chart.data.datasets[1].label = t('seriesMem');
     chart.data.datasets[4].label = t('seriesVram');
-    applyGpuSeries(lastGpus);
+    applyGpuSeries(lastGpus, lastCpuPower);
     chart.update('none');
   }
   gpuSignature = '';
@@ -704,13 +757,15 @@ function bindAuthEvents() {
   });
 }
 
-function pushHistory(ts, cpu, mem, gpu, gpu2, vram) {
+function pushHistory(ts, cpu, mem, gpu, gpu2, vram, cpuPower, gpuPower) {
   history.t.push(ts);
   history.cpu.push(cpu);
   history.mem.push(mem);
   history.gpu.push(gpu);
   history.gpu2.push(gpu2);
   history.vram.push(vram);
+  history.cpuPower.push(cpuPower);
+  history.gpuPower.push(gpuPower);
   if (history.t.length > MAX_HISTORY) {
     history.t.shift();
     history.cpu.shift();
@@ -718,6 +773,8 @@ function pushHistory(ts, cpu, mem, gpu, gpu2, vram) {
     history.gpu.shift();
     history.gpu2.shift();
     history.vram.shift();
+    history.cpuPower.shift();
+    history.gpuPower.shift();
   }
   renderHistory();
 }
@@ -750,6 +807,8 @@ function renderHistory() {
   const gpu = [];
   const gpu2 = [];
   const vram = [];
+  const cpuPower = [];
+  const gpuPower = [];
 
   for (let i = start; i < history.t.length; i += step) {
     const end = Math.min(i + step, history.t.length);
@@ -759,6 +818,8 @@ function renderHistory() {
     gpu.push(bucketAvg(history.gpu, i, end));
     gpu2.push(bucketAvg(history.gpu2, i, end));
     vram.push(bucketAvg(history.vram, i, end));
+    cpuPower.push(bucketAvg(history.cpuPower, i, end));
+    gpuPower.push(bucketAvg(history.gpuPower, i, end));
   }
 
   chart.data.labels = labels;
@@ -767,6 +828,8 @@ function renderHistory() {
   chart.data.datasets[2].data = gpu;
   chart.data.datasets[3].data = gpu2;
   chart.data.datasets[4].data = vram;
+  chart.data.datasets[5].data = cpuPower;
+  chart.data.datasets[6].data = gpuPower;
   chart.update('none');
 }
 
@@ -788,6 +851,12 @@ function setRange(sec) {
 
 function formatTime(d) {
   return d.toTimeString().slice(0, 8);
+}
+
+function formatWatts(value) {
+  const n = Number(value);
+  if (!Number.isFinite(n)) return '--';
+  return `${n < 100 ? n.toFixed(1) : Math.round(n)}W`;
 }
 
 async function loadSystemInfo() {
@@ -828,6 +897,7 @@ async function loadSystemInfo() {
 let lastGpuHtml = null;
 let lastPowerHtml = null;
 let lastGpus = [];
+let lastCpuPower = null;
 let gpuSignature = '';
 
 let gpuKey = localStorage.getItem('gpu-key') || '';
@@ -871,8 +941,8 @@ function setGpuMode(key) {
 }
 
 // 图表固定展示前两块卡（独显 + 核显/第二块卡），标签由后端识别结果决定。
-// 机器上没有的显卡 / 显存信息会从图例和曲线中彻底移除，而不是留一条空线。
-function applyGpuSeries(gpus) {
+// 机器上没有的显卡 / 显存 / 功耗信息会从图例和曲线中彻底移除，而不是留一条空线。
+function applyGpuSeries(gpus, cpuPower = null) {
   if (!chart) return;
   const primary = gpus[0];
   const secondary = gpus[1];
@@ -881,14 +951,21 @@ function applyGpuSeries(gpus) {
   const hasPrimary = !!primary && primary.usagePercent != null;
   const hasSecondary = !!secondary && secondary.usagePercent != null;
   const hasVram = !!primary && primary.vramTotalMB > 0 && primary.vramUsedMB != null;
+  const hasCpuPower = cpuPower != null;
+  const hasGpuPower = !!primary && primary.powerW != null;
 
   ds[2].label = `${primary ? gpuShortName(primary) : 'GPU'} %`;
   ds[3].label = `${secondary ? gpuShortName(secondary) : 'GPU'} %`;
+  ds[5].label = t('seriesCpuPower');
+  ds[6].label = `${primary ? gpuShortName(primary) : 'GPU'} W`;
 
   ds[2].available = hasPrimary;
   ds[3].available = hasSecondary;
   ds[4].available = hasVram;
-  for (const i of [2, 3, 4]) ds[i].hidden = !ds[i].available;
+  ds[5].available = hasCpuPower;
+  ds[6].available = hasGpuPower;
+  for (const i of [2, 3, 4, 5, 6]) ds[i].hidden = !ds[i].available;
+  chart.options.scales.power.display = hasCpuPower || hasGpuPower;
 }
 
 function updateGpuList(gpus) {
@@ -907,7 +984,6 @@ function updateGpuList(gpus) {
   }
 
   const usage = sel.usagePercent != null ? `${Number(sel.usagePercent).toFixed(0)}%` : '--';
-  const hasTemp = sel.temp != null;
   const integrated = sel.kind === 'integrated';
 
   const memLabel = integrated ? t('sharedMem') : (sel.vramTotalMB > 0 ? t('vram') : t('sharedMem'));
@@ -918,23 +994,24 @@ function updateGpuList(gpus) {
     memValue = `${((sel.sharedUsedMB || 0) / 1024).toFixed(1)} GB`;
   }
 
+  const stats = [
+    { label: t('usage'), value: usage },
+    { label: memLabel, value: memValue },
+  ];
+  if (sel.temp != null) stats.push({ label: t('temp'), value: `${Math.round(sel.temp)}°C` });
+  if (sel.powerW != null) stats.push({ label: t('powerDraw'), value: formatWatts(sel.powerW) });
+  if (sel.clockMHz != null) stats.push({ label: t('clock'), value: `${Math.round(sel.clockMHz)} MHz` });
+
+  const statsHtml = stats.map((s) => `
+          <div class="gpu-stat">
+            <div class="gpu-stat-label">${s.label}</div>
+            <div class="gpu-stat-value">${s.value}</div>
+          </div>`).join('');
+
   const html = `
       <div class="gpu-row">
         <div class="gpu-model" title="${sel.model || ''}">${sel.model || 'GPU'}</div>
-        <div class="gpu-stats${hasTemp ? '' : ' no-temp'}">
-          <div class="gpu-stat">
-            <div class="gpu-stat-label">${t('usage')}</div>
-            <div class="gpu-stat-value">${usage}</div>
-          </div>
-          <div class="gpu-stat">
-            <div class="gpu-stat-label">${memLabel}</div>
-            <div class="gpu-stat-value">${memValue}</div>
-          </div>
-          ${hasTemp ? `
-          <div class="gpu-stat">
-            <div class="gpu-stat-label">${t('temp')}</div>
-            <div class="gpu-stat-value">${sel.temp}°C</div>
-          </div>` : ''}
+        <div class="gpu-stats">${statsHtml}
         </div>
       </div>
     `;
@@ -1047,14 +1124,12 @@ async function doTick() {
 
     document.getElementById('cpu-num').textContent = m.cpu.usagePercent.toFixed(1) + '%';
     setGauge('cpu', m.cpu.usagePercent);
-    const cpuTemp = document.getElementById('cpu-temp');
-    if (m.cpu.temp != null) {
-      cpuTemp.hidden = false;
-      cpuTemp.textContent = `${t('temp')} ${m.cpu.temp}°C`;
-    } else {
-      cpuTemp.hidden = true;
-      cpuTemp.textContent = '';
-    }
+    const cpuSub = document.getElementById('cpu-temp');
+    const cpuBits = [];
+    if (m.cpu.temp != null) cpuBits.push(`${t('temp')} ${Math.round(m.cpu.temp)}°C`);
+    if (m.cpu.powerW != null) cpuBits.push(`${t('powerDraw')} ${formatWatts(m.cpu.powerW)}`);
+    cpuSub.hidden = cpuBits.length === 0;
+    cpuSub.textContent = cpuBits.join(' · ');
 
     document.getElementById('mem-num').textContent = m.memory.percent.toFixed(1) + '%';
     setGauge('mem', m.memory.percent);
@@ -1072,13 +1147,15 @@ async function doTick() {
 
     const primary = m.gpus[0] || null;
     const secondary = m.gpus[1] || null;
-    applyGpuSeries(m.gpus);
+    lastCpuPower = m.cpu.powerW ?? null;
+    applyGpuSeries(m.gpus, lastCpuPower);
 
     const gpuUsage = primary && primary.usagePercent != null ? Number(primary.usagePercent) : 0;
     const gpu2Usage = secondary && secondary.usagePercent != null ? Number(secondary.usagePercent) : null;
     const vramPct = primary && primary.vramTotalMB > 0
       ? (primary.vramUsedMB / primary.vramTotalMB) * 100
       : 0;
+    const gpuPower = primary && primary.powerW != null ? Number(primary.powerW) : null;
 
     pushHistory(
       m.timestamp,
@@ -1086,7 +1163,9 @@ async function doTick() {
       m.memory.percent,
       gpuUsage,
       gpu2Usage,
-      vramPct
+      vramPct,
+      lastCpuPower,
+      gpuPower
     );
 
     handleTickSuccess();

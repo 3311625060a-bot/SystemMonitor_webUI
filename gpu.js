@@ -10,6 +10,12 @@ function num(v) {
   return Number.isFinite(n) ? n : 0;
 }
 
+function optNum(v) {
+  if (v == null) return null;
+  const n = Number(v);
+  return Number.isFinite(n) ? n : null;
+}
+
 // 只保留真实存在的适配器；虚拟显示器 / 基础渲染驱动会带 0 显存，直接丢掉。
 function usableAdapters(adapters) {
   return (Array.isArray(adapters) ? adapters : [])
@@ -43,6 +49,8 @@ function baseEntry(adapter, kind, label, shortLabel, model, confidence) {
     dedicatedUsedMB: adapter ? adapter.dedicatedMB : 0,
     sharedUsedMB: adapter ? adapter.sharedMB : 0,
     temp: null,
+    powerW: null,
+    clockMHz: null,
     vramUsedMB: null,
     vramTotalMB: 0,
   };
@@ -74,7 +82,9 @@ export function classifyGpuAdapters(adapters, nvidiaGpus = [], wmiGpus = []) {
       used.add(bestIdx);
       const e = baseEntry(clean[bestIdx], 'discrete', '独立显卡', '独显', ng.model || 'NVIDIA GPU', 'high');
       e.usagePercent = ng.usagePercent != null ? num(ng.usagePercent) : e.usagePercent;
-      e.temp = ng.temp != null ? num(ng.temp) : null;
+      e.temp = optNum(ng.temp);
+      e.powerW = optNum(ng.powerW);
+      e.clockMHz = optNum(ng.clockMHz);
       e.vramUsedMB = num(ng.vramUsedMB);
       e.vramTotalMB = num(ng.vramTotalMB);
       entries.push(e);
@@ -83,7 +93,9 @@ export function classifyGpuAdapters(adapters, nvidiaGpus = [], wmiGpus = []) {
       const e = baseEntry(null, 'discrete', '独立显卡', '独显', ng.model || 'NVIDIA GPU', 'low');
       e.key = 'nvidia:' + (ng.model || 'gpu');
       e.usagePercent = ng.usagePercent != null ? num(ng.usagePercent) : null;
-      e.temp = ng.temp != null ? num(ng.temp) : null;
+      e.temp = optNum(ng.temp);
+      e.powerW = optNum(ng.powerW);
+      e.clockMHz = optNum(ng.clockMHz);
       e.vramUsedMB = num(ng.vramUsedMB);
       e.vramTotalMB = num(ng.vramTotalMB);
       entries.push(e);

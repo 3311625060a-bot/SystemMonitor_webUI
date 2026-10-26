@@ -115,6 +115,7 @@ async function getSystemInfo() {
 const state = {
   cpuUsage: 0,
   cpuTemp: null,
+  cpuPower: null,
   gpus: [],
   gpuAdapters: [],
   gpuSampleAt: 0,
@@ -151,9 +152,97 @@ setInterval(() => {
 
 const SAMPLE_INTERVAL_MS = 2000;
 
+// ASUS ACPI 设备路径在 C# 里用逐字字符串（@"..."）书写，JS 侧先转成实际路径，
+// 避免多层转义把反斜杠吃掉。
+const ATKACPI_DEVICE = '\\\\.\\ATKACPI';
+
 const SAMPLER_SCRIPT = `
 [Console]::OutputEncoding = [Text.Encoding]::UTF8
 $ErrorActionPreference = 'SilentlyContinue'
+
+function NumOrNull([string]$v) {
+  $n = 0.0
+  if ([double]::TryParse($v, [Globalization.NumberStyles]::Float, [Globalization.CultureInfo]::InvariantCulture, [ref]$n)) { return $n }
+  return $null
+}
+
+# 非华硕 / ACPI 不可用时的后备：热区性能计数器通常允许普通用户读取，
+# 最后再尝试 MSAcpi_ThermalZoneTemperature（部分系统会拒绝访问）。
+function GetThermalTemp {
+  $rows = Get-CimInstance -Namespace root/cimv2 -ClassName Win32_PerfFormattedData_Counters_ThermalZoneInformation
+  foreach ($r in @($rows)) {
+    $hk = NumOrNull ([string]$r.HighPrecisionTemperature)
+    if ($hk -ne $null -and $hk -gt 0) {
+      $c = [math]::Round($hk / 10 - 273.15, 1)
+    } else {
+      $k = NumOrNull ([string]$r.Temperature)
+      if ($k -eq $null -or $k -le 0) { continue }
+      $c = [math]::Round($k - 273.15, 1)
+    }
+    if ($c -gt 0 -and $c -lt 150) { return $c }
+  }
+  $tz = Get-CimInstance MSAcpi_ThermalZoneTemperature -Namespace root/wmi | Select-Object -First 1 -ExpandProperty CurrentTemperature
+  if ($tz) {
+    $c = [math]::Round(($tz - 2732) / 10, 1)
+    if ($c -gt 0 -and $c -lt 150) { return $c }
+  }
+  return $null
+}
+
+# 华硕笔记本的 ATKACPI 设备允许普通用户只读查询 CPU 温度，无需管理员权限。
+# 首次调用 Add-Type 约 120ms，之后只做一次 IOCTL，单次约 0.4ms。
+$acpiType = @'
+using System;
+using System.Runtime.InteropServices;
+
+public static class AsusAcpi {
+  const uint CONTROL_CODE = 0x0022240C;
+  const uint DSTS = 0x53545344;
+  static IntPtr handle = new IntPtr(-1);
+
+  [DllImport("kernel32.dll", SetLastError = true, CharSet = CharSet.Unicode)]
+  static extern IntPtr CreateFile(string name, uint access, uint share, IntPtr sa, uint disposition, uint flags, IntPtr template);
+
+  [DllImport("kernel32.dll", SetLastError = true)]
+  static extern bool DeviceIoControl(IntPtr h, uint code, byte[] inBuf, uint inSize, byte[] outBuf, uint outSize, out uint returned, IntPtr overlapped);
+
+  [DllImport("kernel32.dll", SetLastError = true)]
+  static extern bool CloseHandle(IntPtr h);
+
+  public static bool Open() {
+    if (handle != new IntPtr(-1)) return true;
+    handle = CreateFile(@"${ATKACPI_DEVICE}", 0xC0000000, 3, IntPtr.Zero, 3, 0, IntPtr.Zero);
+    return handle != new IntPtr(-1);
+  }
+
+  public static void Close() {
+    if (handle != new IntPtr(-1)) {
+      CloseHandle(handle);
+      handle = new IntPtr(-1);
+    }
+  }
+
+  public static int Get(uint id) {
+    if (!Open()) return -1;
+    byte[] input = new byte[16];
+    BitConverter.GetBytes(DSTS).CopyTo(input, 0);
+    BitConverter.GetBytes(8u).CopyTo(input, 4);
+    BitConverter.GetBytes(id).CopyTo(input, 8);
+    byte[] output = new byte[16];
+    uint returned;
+    if (!DeviceIoControl(handle, CONTROL_CODE, input, 16, output, 16, out returned, IntPtr.Zero)) return -1;
+    int raw = BitConverter.ToInt32(output, 0);
+    return raw >= 65536 ? raw - 65536 : -1;
+  }
+}
+'@
+
+$acpiReady = $false
+try {
+  Add-Type -TypeDefinition $acpiType
+  $acpiReady = [AsusAcpi]::Open()
+} catch {}
+
 $paths = @(
   '\\Network Interface(*)\\Bytes Received/sec',
   '\\Network Interface(*)\\Bytes Sent/sec',
@@ -162,7 +251,11 @@ $paths = @(
 )
 $gpu = @()
 $temp = $null
+$acpiFailures = 0
+if (-not $acpiReady) { $acpiFailures = 3 }
 $battery = $null
+$powerCounter = $null
+$powerFailures = 0
 $i = 0
 $parentPid = ${process.pid}
 while ($true) {
@@ -180,22 +273,76 @@ while ($true) {
     }
   }
 
-  $out = nvidia-smi --query-gpu=name,utilization.gpu,memory.used,memory.total,temperature.gpu --format=csv,noheader,nounits 2>$null
+  $out = nvidia-smi --query-gpu=name,utilization.gpu,memory.used,memory.total,temperature.gpu,power.draw,clocks.sm --format=csv,noheader,nounits 2>$null
   if ($out) {
     $gpu = @()
     foreach ($line in $out) {
       if (-not $line) { continue }
       $f = $line -split ',\\s*'
-      $gpu += [pscustomobject]@{ name = $f[0]; usage = [int]$f[1]; vramUsed = [int]$f[2]; vramTotal = [int]$f[3]; temp = [int]$f[4] }
+      $gpu += [pscustomobject]@{
+        name = $f[0]
+        usage = NumOrNull $f[1]
+        vramUsed = NumOrNull $f[2]
+        vramTotal = NumOrNull $f[3]
+        temp = NumOrNull $f[4]
+        power = NumOrNull $f[5]
+        clock = NumOrNull $f[6]
+      }
+    }
+  }
+
+  # CPU 温度：优先 ACPI，每 2 秒一次；连续失败时才回退到较慢的热区 WMI。
+  $t = $null
+  if ($acpiReady) {
+    try { $t = [AsusAcpi]::Get(0x00120094) } catch { $t = -1 }
+  }
+  if ($t -gt 0 -and $t -lt 150) {
+    $temp = [double]$t
+    $acpiFailures = 0
+  } else {
+    $acpiFailures++
+    if ($acpiFailures -ge 3 -and ($i % 15 -eq 0 -or $i -eq 3)) {
+      $c2 = GetThermalTemp
+      if ($c2 -ne $null) { $temp = $c2 }
+    }
+  }
+
+  # CPU 功耗：Windows Energy Meter 的包功耗计数器，单位 mW，缓存句柄后开销很低。
+  if (-not $powerCounter -and $i % 60 -eq 0) {
+    foreach ($name in @('rapl_package0_pkg', 'apu power', 'socket power', 'cpu power')) {
+      $pc = $null
+      try {
+        $pc = New-Object Diagnostics.PerformanceCounter('Energy Meter', 'Power', $name, $true)
+        [void]$pc.NextValue()
+        $powerCounter = $pc
+        $powerFailures = 0
+        break
+      } catch {
+        if ($pc) { $pc.Dispose() }
+      }
+    }
+  }
+  $cpuPower = $null
+  if ($powerCounter) {
+    try {
+      $mw = $powerCounter.NextValue()
+      if ($mw -ge 30 -and $mw -lt 500000) {
+        $cpuPower = [math]::Round($mw / 1000, 1)
+        $powerFailures = 0
+      } else {
+        $powerFailures++
+      }
+    } catch {
+      $powerFailures++
+    }
+    if ($powerFailures -ge 3) {
+      $powerCounter.Dispose()
+      $powerCounter = $null
+      $powerFailures = 0
     }
   }
 
   if ($i % 15 -eq 0) {
-    $t = Get-CimInstance MSAcpi_ThermalZoneTemperature -Namespace root/wmi | Select-Object -First 1 -ExpandProperty CurrentTemperature
-    if ($t) {
-      $c2 = [math]::Round(($t - 2732) / 10, 1)
-      if ($c2 -gt 0 -and $c2 -lt 150) { $temp = $c2 }
-    }
     $b = Get-CimInstance Win32_Battery | Select-Object -First 1
     if ($b -and $null -ne $b.EstimatedChargeRemaining) {
       $battery = [pscustomobject]@{ percent = [int]$b.EstimatedChargeRemaining; acConnected = ($b.BatteryStatus -eq 2) }
@@ -207,13 +354,15 @@ while ($true) {
   $obj = [pscustomobject]@{
     netDown = [double]$netDown; netUp = [double]$netUp
     diskRead = [double]$diskRead; diskWrite = [double]$diskWrite
-    gpus = $gpu; temp = $temp; battery = $battery
+    gpus = $gpu; temp = $temp; cpuPower = $cpuPower; battery = $battery
   }
   [Console]::Out.WriteLine(($obj | ConvertTo-Json -Compress -Depth 4))
   [Console]::Out.Flush()
   $i++
   Start-Sleep -Milliseconds ${SAMPLE_INTERVAL_MS}
 }
+try { [AsusAcpi]::Close() } catch {}
+try { if ($powerCounter) { $powerCounter.Dispose() } } catch {}
 `;
 
 const SAMPLER_ARGV = [
@@ -228,6 +377,12 @@ let samplerRestartTimer = null;
 let samplerStopped = false;
 let samplerRestarts = 0;
 
+function numOrNull(value) {
+  if (value == null || value === '') return null;
+  const n = Number(value);
+  return Number.isFinite(n) ? n : null;
+}
+
 function applySample(line) {
   let s;
   try {
@@ -239,7 +394,8 @@ function applySample(line) {
   state.netUp = s.netUp || 0;
   state.diskRead = s.diskRead || 0;
   state.diskWrite = s.diskWrite || 0;
-  if (s.temp != null) state.cpuTemp = s.temp;
+  state.cpuTemp = numOrNull(s.temp);
+  state.cpuPower = numOrNull(s.cpuPower);
   state.battery = s.battery
     ? { percent: s.battery.percent, acConnected: !!s.battery.acConnected }
     : null;
@@ -248,10 +404,12 @@ function applySample(line) {
   state.gpus = list.map((g) => ({
     model: g.name || 'GPU',
     vendor: 'NVIDIA',
-    usagePercent: g.usage != null ? g.usage : null,
-    vramUsedMB: g.vramUsed || 0,
-    vramTotalMB: g.vramTotal || 0,
-    temp: g.temp != null ? g.temp : null,
+    usagePercent: numOrNull(g.usage),
+    vramUsedMB: numOrNull(g.vramUsed) ?? 0,
+    vramTotalMB: numOrNull(g.vramTotal) ?? 0,
+    temp: numOrNull(g.temp),
+    powerW: numOrNull(g.power),
+    clockMHz: numOrNull(g.clock),
   }));
 }
 
@@ -436,6 +594,7 @@ function getMetrics() {
     cpu: {
       usagePercent: state.cpuUsage,
       temp: state.cpuTemp,
+      powerW: state.cpuPower,
     },
     memory: {
       usedGB,
