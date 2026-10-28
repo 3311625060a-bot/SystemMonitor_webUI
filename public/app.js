@@ -5,6 +5,8 @@ const RANGES = [60, 300, 900, 3600];
 const THEME_KEY = 'theme';
 const LANG_KEY = 'lang';
 const RANGE_KEY = 'range';
+const POLL_KEY = 'poll';
+const POLL_OPTIONS = [1, 2, 5, 10];
 
 function detectLang() {
   const nav = String(navigator.language || (navigator.languages && navigator.languages[0]) || 'zh').toLowerCase();
@@ -23,10 +25,18 @@ try {
   if (RANGES.includes(saved)) rangeSec = saved;
 } catch (e) {}
 
+let pollSec = 1;
+try {
+  const savedPoll = Number(localStorage.getItem(POLL_KEY));
+  if (POLL_OPTIONS.includes(savedPoll)) pollSec = savedPoll;
+} catch (e) {}
+
 let authMode = null;
 let authBusy = false;
 let authErrorKey = '';
 let authLocalTrust = true;
+// 后台采样策略，由 /api/metrics 带回（托盘开关改的就是它），只用于让提示文案与实际一致。
+let samplerIdlePause = true;
 let appStarted = false;
 let connFailures = 0;
 let retryBusy = false;
@@ -50,6 +60,13 @@ const I18N = {
     range5m: '5 分钟',
     range15m: '15 分钟',
     range1h: '1 小时',
+    pollInterval: '页面刷新频率',
+    pollHint: '降低刷新频率可减少浏览器与网络开销；页面和托盘面板都停止观测约 2 分钟后，后台采样会自动暂停',
+    pollHintResident: '降低刷新频率可减少浏览器与网络开销；后台采样当前常驻运行，可在托盘面板的“空闲时暂停采样”开关改回自动暂停',
+    poll1s: '1 秒',
+    poll2s: '2 秒',
+    poll5s: '5 秒',
+    poll10s: '10 秒',
     gpuDetails: '显卡详情',
     power: '电源',
     io: 'I/O 吞吐量',
@@ -77,6 +94,7 @@ const I18N = {
     liveAt: '实时 · 更新于',
     disconnected: '连接断开：',
     connLost: '连接已断开',
+    samplingResuming: '采样恢复中…',
     retry: '重试',
     retrying: '重试中…',
     password: '密码',
@@ -136,6 +154,13 @@ const I18N = {
     range5m: '5m',
     range15m: '15m',
     range1h: '1h',
+    pollInterval: 'Page refresh rate',
+    pollHint: 'A lower refresh rate reduces browser and network work. Background sampling pauses about 2 minutes after the page and the tray panel stop observing.',
+    pollHintResident: 'A lower refresh rate reduces browser and network work. Background sampling currently stays resident — turn the “Pause sampling when idle” switch in the tray panel to resume auto-pausing.',
+    poll1s: '1s',
+    poll2s: '2s',
+    poll5s: '5s',
+    poll10s: '10s',
     gpuDetails: 'GPU Details',
     power: 'Power',
     io: 'I/O Throughput',
@@ -163,6 +188,7 @@ const I18N = {
     liveAt: 'Live · updated at',
     disconnected: 'Disconnected: ',
     connLost: 'Connection lost',
+    samplingResuming: 'Resuming sampling…',
     retry: 'Retry',
     retrying: 'Retrying…',
     password: 'Password',
@@ -490,6 +516,7 @@ function applyStaticText() {
     langBtn.title = t('langSwitch');
     langBtn.setAttribute('aria-label', t('langSwitch'));
   }
+  updatePollControl();
   refreshThemeLabel();
 }
 
@@ -849,6 +876,25 @@ function setRange(sec) {
   renderHistory();
 }
 
+function updatePollControl() {
+  const select = document.getElementById('poll-interval');
+  if (!select) return;
+  select.value = String(pollSec);
+  select.title = t(samplerIdlePause ? 'pollHint' : 'pollHintResident');
+  select.setAttribute('aria-label', t('pollInterval'));
+}
+
+function setPollInterval(sec) {
+  if (!POLL_OPTIONS.includes(sec) || sec === pollSec) return;
+  pollSec = sec;
+  try { localStorage.setItem(POLL_KEY, String(sec)); } catch (e) {}
+  updatePollControl();
+  if (pollTimer) {
+    clearInterval(pollTimer);
+    pollTimer = setInterval(tick, pollSec * 1000);
+  }
+}
+
 function formatTime(d) {
   return d.toTimeString().slice(0, 8);
 }
@@ -1080,11 +1126,23 @@ function hideConnBanner() {
   }
 }
 
-function handleTickSuccess() {
+function handleTickSuccess(m) {
   connFailures = 0;
   hideConnBanner();
+  // 托盘里改了开关，页面提示要跟着变，否则文案会和实际策略不一致。
+  const pause = m && m.sampler ? m.sampler.idlePause : null;
+  if (typeof pause === 'boolean' && pause !== samplerIdlePause) {
+    samplerIdlePause = pause;
+    updatePollControl();
+  }
   const status = document.getElementById('status');
-  if (status) status.textContent = `${t('liveAt')} ${formatTime(new Date())}`;
+  if (!status) return;
+  // 空闲暂停后刚恢复时，返回的仍是暂停前的数值，先据实提示而不是声称"实时"。
+  if (m && m.sampler && m.sampler.stale) {
+    status.textContent = t('samplingResuming');
+    return;
+  }
+  status.textContent = `${t('liveAt')} ${formatTime(new Date())}`;
 }
 
 function handleTickFailure() {
@@ -1168,7 +1226,7 @@ async function doTick() {
       gpuPower
     );
 
-    handleTickSuccess();
+    handleTickSuccess(m);
     return true;
   } catch (e) {
     handleTickFailure();
@@ -1202,7 +1260,7 @@ async function retryConnection() {
 function startPolling() {
   if (pollTimer) return;
   tick();
-  pollTimer = setInterval(tick, 1000);
+  pollTimer = setInterval(tick, pollSec * 1000);
 }
 
 function stopPolling() {
@@ -1217,6 +1275,7 @@ window.addEventListener('DOMContentLoaded', async () => {
   applyGpuSeries([]);
   applyStaticText();
   updateRangeToggle();
+  updatePollControl();
 
   // 用户未手动选择过主题时，跟随系统明暗设置实时变化
   const darkMedia = window.matchMedia ? window.matchMedia('(prefers-color-scheme: dark)') : null;
@@ -1256,6 +1315,11 @@ window.addEventListener('DOMContentLoaded', async () => {
       const btn = e.target.closest('button');
       if (btn && btn.dataset.range) setRange(Number(btn.dataset.range));
     });
+  }
+
+  const pollSelect = document.getElementById('poll-interval');
+  if (pollSelect) {
+    pollSelect.addEventListener('change', () => setPollInterval(Number(pollSelect.value)));
   }
 
   const connRetry = document.getElementById('conn-retry');

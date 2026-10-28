@@ -4,7 +4,13 @@ setlocal EnableDelayedExpansion
 title 系统监控 - System Monitor
 cd /d "%~dp0"
 
-set "PORT=3000"
+REM ===== 0. 端口解析：SM_PORT 环境变量 > %LOCALAPPDATA%\SystemMonitor\port.txt > 3000 =====
+set "PORT=%SM_PORT%"
+if not defined PORT if exist "%LOCALAPPDATA%\SystemMonitor\port.txt" set /p PORT=<"%LOCALAPPDATA%\SystemMonitor\port.txt"
+if not defined PORT set "PORT=3000"
+echo !PORT!| findstr /r /c:"^[1-9][0-9]*$" >nul || set "PORT=3000"
+if !PORT! gtr 65535 set "PORT=3000"
+set "SM_PORT=!PORT!"
 set "LOGFILE=%~dp0server.log"
 set "ERRFILE=%~dp0server.err.log"
 set "RUNTIME=%~dp0runtime"
@@ -28,6 +34,7 @@ if !errorlevel! equ 0 (
         exit /b 0
     )
     echo [错误] 端口 !PORT! 已被其他程序占用，系统监控无法启动。
+    echo        换端口：node port.js set ^<端口^>  然后重新双击本脚本
     echo        可用以下命令查看占用进程：netstat -ano ^| findstr :!PORT!
     echo.
     pause
@@ -124,7 +131,7 @@ if exist "%ERRFILE%" type "%ERRFILE%"
 if exist "%LOGFILE%" type "%LOGFILE%"
 echo ----------------------------------------
 echo 常见原因：
-echo   1. 端口 !PORT! 被其他程序占用：netstat -ano ^| findstr :!PORT!
+echo   1. 端口 !PORT! 被其他程序占用：netstat -ano ^| findstr :!PORT!  换端口：node port.js set ^<端口^>
 echo   2. Node.js 版本过低，需要 v18 或更高版本
 echo   3. 安全软件拦截了 node.exe 或 PowerShell
 echo.

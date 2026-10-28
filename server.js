@@ -7,6 +7,8 @@ import { cpus, totalmem, freemem, networkInterfaces } from 'node:os';
 import { isIP } from 'node:net';
 import { classifyGpuAdapters } from './gpu.js';
 import { startTray, stopTray } from './tray.js';
+import { resolvePort } from './port.js';
+import { loadSettings, saveSettings } from './settings.js';
 import {
   AuthStore,
   defaultDataDir,
@@ -15,13 +17,18 @@ import {
 } from './auth.js';
 
 const __dirname = fileURLToPath(new URL('.', import.meta.url));
-const PORT = 3000;
+const { port: PORT, source: PORT_SOURCE } = resolvePort();
 const PUBLIC_DIR = join(__dirname, 'public');
 const SESSION_COOKIE = 'sm_session';
 const AUTH_DATA_DIR = defaultDataDir();
 
 const auth = new AuthStore(AUTH_DATA_DIR);
 await auth.load();
+
+const settings = loadSettings(AUTH_DATA_DIR);
+// 空闲暂停开关（托盘面板可切换）：true = 无人观测约 2 分钟后暂停主采样器，
+// false = 主采样器常驻，行为与旧版本一致。
+let samplerIdlePause = settings.samplerIdlePause !== false;
 
 // 仅当来源是回环地址或本机网卡地址时才视为“本机”。反向代理/内网穿透场景可设置
 // SYSTEM_MONITOR_LOCAL_TRUST=0，让所有请求都必须输入密码。
@@ -119,6 +126,7 @@ const state = {
   gpus: [],
   gpuAdapters: [],
   gpuSampleAt: 0,
+  sampleAt: 0,
   lastMetricsAt: 0,
   battery: null,
   netDown: 0,
@@ -140,7 +148,9 @@ function cpuSnapshot() {
 
 let prevCpu = cpuSnapshot();
 
-setInterval(() => {
+// CPU 占用率在本进程算（os.cpus() 差值），和主采样器一起启停：
+// 暂停时连这个 1 秒定时器也不跑，恢复时重置基线，避免把整段空闲期算成一次采样。
+function sampleCpuUsage() {
   const cur = cpuSnapshot();
   const dTotal = cur.total - prevCpu.total;
   const dIdle = cur.idle - prevCpu.idle;
@@ -148,7 +158,22 @@ setInterval(() => {
     state.cpuUsage = +(Math.max(0, Math.min(100, (1 - dIdle / dTotal) * 100))).toFixed(1);
   }
   prevCpu = cur;
-}, 1000).unref();
+}
+
+let cpuTimer = null;
+
+function startCpuTimer() {
+  if (cpuTimer) return;
+  prevCpu = cpuSnapshot();
+  cpuTimer = setInterval(sampleCpuUsage, 1000);
+  cpuTimer.unref();
+}
+
+function stopCpuTimer() {
+  if (!cpuTimer) return;
+  clearInterval(cpuTimer);
+  cpuTimer = null;
+}
 
 const SAMPLE_INTERVAL_MS = 2000;
 
@@ -375,6 +400,8 @@ const SAMPLER_ARGV = [
 let sampler = null;
 let samplerRestartTimer = null;
 let samplerStopped = false;
+let samplerPaused = false;
+let samplerIdleTimer = null;
 let samplerRestarts = 0;
 
 function numOrNull(value) {
@@ -390,6 +417,7 @@ function applySample(line) {
   } catch {
     return;
   }
+  state.sampleAt = Date.now();
   state.netDown = s.netDown || 0;
   state.netUp = s.netUp || 0;
   state.diskRead = s.diskRead || 0;
@@ -414,12 +442,15 @@ function applySample(line) {
 }
 
 function startSampler() {
-  if (samplerStopped) return;
-  sampler = spawn('powershell.exe', SAMPLER_ARGV, { windowsHide: true, stdio: ['ignore', 'pipe', 'pipe'] });
+  if (samplerStopped || samplerPaused || sampler) return;
+
+  const proc = spawn('powershell.exe', SAMPLER_ARGV, { windowsHide: true, stdio: ['ignore', 'pipe', 'pipe'] });
+  sampler = proc;
+  startCpuTimer();
 
   let buf = '';
-  sampler.stdout.setEncoding('utf8');
-  sampler.stdout.on('data', (chunk) => {
+  proc.stdout.setEncoding('utf8');
+  proc.stdout.on('data', (chunk) => {
     buf += chunk;
     let idx;
     while ((idx = buf.indexOf('\n')) >= 0) {
@@ -430,16 +461,17 @@ function startSampler() {
     if (buf.length > 64 * 1024) buf = '';
   });
 
-  sampler.stderr.on('data', () => {});
+  proc.stderr.on('data', () => {});
 
-  sampler.on('error', () => {
-    sampler = null;
-    if (!samplerStopped) samplerRestartTimer = setTimeout(startSampler, 5000);
+  proc.on('error', () => {
+    if (sampler === proc) sampler = null;
+    if (!samplerStopped && !samplerPaused) samplerRestartTimer = setTimeout(startSampler, 5000);
   });
 
-  sampler.on('exit', () => {
-    sampler = null;
-    if (samplerStopped) return;
+  proc.on('exit', () => {
+    // 只清理自己这条进程：暂停后立即恢复时，旧进程的 exit 可能晚于新进程创建。
+    if (sampler === proc) sampler = null;
+    if (samplerStopped || samplerPaused) return;
     if (samplerRestarts < 3) {
       samplerRestarts += 1;
       console.warn('sampler exited, restarting...');
@@ -448,9 +480,87 @@ function startSampler() {
   });
 }
 
+// 空闲暂停：页面和托盘面板都停止观测一段时间后，结束主采样器（连同本进程的
+// 1 秒 CPU 定时器）。下一次 /api/metrics 请求会立即把它拉起来，所以从用户角度看
+// 只是恢复后的第一个周期数据略旧，界面会显示"采样恢复中"。
+const SAMPLER_IDLE_STOP_MS = 120000;
+const SAMPLER_STALE_MS = 10000;
+
+function pauseSampler() {
+  if (samplerPaused || !samplerIdlePause) return;
+  samplerPaused = true;
+  if (samplerRestartTimer) {
+    clearTimeout(samplerRestartTimer);
+    samplerRestartTimer = null;
+  }
+  stopCpuTimer();
+  const proc = sampler;
+  sampler = null;
+  if (proc) {
+    try {
+      proc.kill();
+    } catch {}
+  }
+  console.log(`sampler paused: no observer for ${Math.round(SAMPLER_IDLE_STOP_MS / 1000)}s`);
+}
+
+function resumeSampler() {
+  if (!samplerPaused) return;
+  samplerPaused = false;
+  samplerRestarts = 0;
+  console.log('sampler resumed: observer detected');
+  startSampler();
+}
+
+function scheduleSamplerIdleCheck() {
+  if (samplerIdleTimer) {
+    clearTimeout(samplerIdleTimer);
+    samplerIdleTimer = null;
+  }
+  if (!samplerIdlePause) return;
+  const wait = Math.max(0, state.lastMetricsAt + SAMPLER_IDLE_STOP_MS - Date.now()) + 1000;
+  samplerIdleTimer = setTimeout(() => {
+    samplerIdleTimer = null;
+    if (Date.now() - state.lastMetricsAt >= SAMPLER_IDLE_STOP_MS) pauseSampler();
+    else scheduleSamplerIdleCheck();
+  }, wait);
+  samplerIdleTimer.unref();
+}
+
+// 观测者信号：/api/metrics 每被请求一次就刷新一次。
+function touchSampler() {
+  state.lastMetricsAt = Date.now();
+  resumeSampler();
+  scheduleSamplerIdleCheck();
+}
+
+// 托盘开关：关掉暂停就是常驻模式（立刻唤醒并停掉空闲计时），
+// 打开后从当前时刻重新计时，不会刚切换完就立刻暂停。
+function setSamplerIdlePause(enabled) {
+  const next = !!enabled;
+  if (next === samplerIdlePause) return samplerIdlePause;
+  samplerIdlePause = next;
+  if (samplerIdlePause) {
+    state.lastMetricsAt = Date.now();
+    startSampler();
+  } else {
+    resumeSampler();
+    startSampler();
+  }
+  scheduleSamplerIdleCheck();
+  console.log(`sampler idle pause ${samplerIdlePause ? 'enabled' : 'disabled'} (sampler ${samplerIdlePause ? 'will pause when unobserved' : 'resident'})`);
+  return samplerIdlePause;
+}
+
 function stopSampler() {
   samplerStopped = true;
+  samplerPaused = false;
+  if (samplerIdleTimer) {
+    clearTimeout(samplerIdleTimer);
+    samplerIdleTimer = null;
+  }
   if (samplerRestartTimer) clearTimeout(samplerRestartTimer);
+  stopCpuTimer();
   if (sampler) sampler.kill();
 }
 
@@ -603,6 +713,15 @@ function getMetrics() {
     },
     gpus: buildGpuList(),
     gpuSampledAt: state.gpuSampleAt,
+    sampler: {
+      sampledAt: state.sampleAt || null,
+      // 刚恢复、或采样进程还没跑出第一条数据时，数值来自上一次采样，界面据此提示。
+      // 请求本身就会唤醒采样器，所以对外只会读到 stale 这一个状态。
+      stale: !state.sampleAt || Date.now() - state.sampleAt > SAMPLER_STALE_MS,
+      idleStopMs: SAMPLER_IDLE_STOP_MS,
+      // 托盘开关的当前状态，前端用它保证提示文案与实际策略一致。
+      idlePause: samplerIdlePause,
+    },
     power: state.battery
       ? { type: 'battery', percent: state.battery.percent, acConnected: state.battery.acConnected }
       : null,
@@ -906,12 +1025,47 @@ async function handleApi(req, res) {
     return true;
   }
 
+  if (url.pathname === '/api/settings') {
+    if (req.method === 'GET') {
+      sendJson(res, 200, { samplerIdlePause, idleStopMs: SAMPLER_IDLE_STOP_MS });
+      return true;
+    }
+    if (req.method === 'POST' || req.method === 'PUT') {
+      // 采样策略是本机自己的事：远程设备只能看，不能把宿主机的采样器关掉。
+      if (!isLocalAddress(req)) {
+        sendJson(res, 403, { error: 'local_only' });
+        return true;
+      }
+      let body;
+      try {
+        body = await readJsonBody(req);
+      } catch (err) {
+        sendJson(res, err.status || 400, { error: err.message });
+        return true;
+      }
+      if (typeof body?.samplerIdlePause !== 'boolean') {
+        sendJson(res, 400, { error: 'invalid_settings' });
+        return true;
+      }
+      const applied = setSamplerIdlePause(body.samplerIdlePause);
+      try {
+        saveSettings({ samplerIdlePause: applied }, AUTH_DATA_DIR);
+      } catch (err) {
+        console.error('[settings] save failed:', err.message);
+      }
+      sendJson(res, 200, { samplerIdlePause: applied, idleStopMs: SAMPLER_IDLE_STOP_MS });
+      return true;
+    }
+    sendJson(res, 405, { error: 'method_not_allowed' }, { Allow: 'GET, POST' });
+    return true;
+  }
   if (url.pathname === '/api/system-info') {
     const data = await getSystemInfo();
     sendJson(res, 200, data);
     return true;
   }
   if (url.pathname === '/api/metrics') {
+    touchSampler();
     touchGpuSampler();
     sendJson(res, 200, getMetrics());
     return true;
@@ -981,11 +1135,13 @@ let listenHost = '::';
 function onListening() {
   server.removeListener('error', onListenError);
   server.on('error', (err) => console.error('Server error:', err));
-  console.log(`System monitor running at http://localhost:${PORT} (listening on ${listenHost === '::' ? '[::]' : listenHost})`);
+  console.log(`System monitor running at http://localhost:${PORT} (listening on ${listenHost === '::' ? '[::]' : listenHost}, port from ${PORT_SOURCE})`);
   console.log(auth.hasPassword()
     ? `Access control: password configured (${TRUST_LOCAL ? 'local access is trusted' : 'local trust disabled'})`
     : 'Access control: waiting for first local password setup');
   startSampler();
+  // 启动后给一段热备期：无人观测超过 SAMPLER_IDLE_STOP_MS 才暂停，页面随时打开都有数据。
+  touchSampler();
   // 启动即预热一次 GPU 采集，页面打开时就能直接看到全部显卡。
   touchGpuSampler();
   startTray(PORT);
@@ -1003,6 +1159,9 @@ function onListenError(err) {
     return;
   }
   console.error(`Failed to listen on port ${PORT}: ${err.message}`);
+  if (err.code === 'EADDRINUSE') {
+    console.error('端口已被占用。可改用其他端口：node port.js set <端口>，或设置环境变量 SM_PORT，或加参数 --port <端口>。');
+  }
   process.exit(1);
 }
 

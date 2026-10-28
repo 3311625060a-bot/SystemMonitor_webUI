@@ -1,9 +1,33 @@
 ﻿param(
   [Parameter(Mandatory = $true)][int]$ServerPid,
-  [string]$Url = 'http://127.0.0.1:3000'
+  [string]$Url = ''
 )
 
 $ErrorActionPreference = 'Stop'
+
+# 与服务端 port.js 保持一致：SM_PORT 环境变量 > %LOCALAPPDATA%\SystemMonitor\port.txt > 3000
+function Get-ListenPort {
+  $candidates = @($env:SM_PORT)
+  if ($env:LOCALAPPDATA) {
+    $portFile = Join-Path (Join-Path $env:LOCALAPPDATA 'SystemMonitor') 'port.txt'
+    if (Test-Path -LiteralPath $portFile) {
+      $firstLine = (Get-Content -LiteralPath $portFile -TotalCount 1)
+      $candidates += (-join ($firstLine -replace '[^0-9]', ''))
+    }
+  }
+  foreach ($candidate in $candidates) {
+    if (-not $candidate) { continue }
+    $value = 0
+    if ([int]::TryParse($candidate.Trim(), [ref]$value) -and $value -ge 1 -and $value -le 65535) {
+      return $value
+    }
+  }
+  return 3000
+}
+
+if (-not $Url) {
+  $Url = ('http://127.0.0.1:{0}' -f (Get-ListenPort))
+}
 
 $mutex = New-Object System.Threading.Mutex($false, 'Local\SystemMonitorTray')
 $acquired = $false
@@ -117,7 +141,7 @@ namespace SystemMonitorTray
     public sealed class ModernTrayPopup : Form
     {
         private const float BaseWidth = 360f;
-        private const float BaseHeight = 442f;
+        private const float BaseHeight = 494f;
         private const int WmDpiChanged = 0x02E0;
 
         private TrayMetrics metrics;
@@ -136,13 +160,16 @@ namespace SystemMonitorTray
         private RectangleF rectOpen;
         private RectangleF rectExit;
         private RectangleF rectAutoStart;
+        private RectangleF rectIdlePause;
         private bool autoStart;
+        private bool idlePause = true;
         private int hover;
         private int pressed;
 
         public event EventHandler OpenRequested;
         public event EventHandler ExitRequested;
         public event EventHandler AutoStartToggled;
+        public event EventHandler IdlePauseToggled;
 
         public ModernTrayPopup()
         {
@@ -184,6 +211,19 @@ namespace SystemMonitorTray
                 if (autoStart != value)
                 {
                     autoStart = value;
+                    Invalidate();
+                }
+            }
+        }
+
+        public bool IdlePause
+        {
+            get { return idlePause; }
+            set
+            {
+                if (idlePause != value)
+                {
+                    idlePause = value;
                     Invalidate();
                 }
             }
@@ -307,12 +347,14 @@ namespace SystemMonitorTray
             float cardHeight = SF(80);
             float gap = SF(10);
             float autoTop = cardTop + cardHeight * 3 + gap * 2 + SF(12);
-            float autoHeight = SF(42);
-            float buttonTop = autoTop + autoHeight + SF(12);
+            float rowHeight = SF(42);
+            float idleTop = autoTop + rowHeight + SF(10);
+            float buttonTop = idleTop + rowHeight + SF(12);
             float buttonHeight = SF(40);
             float contentWidth = ClientSize.Width - pad * 2 - gap;
             float openWidth = (float)Math.Round(contentWidth * 0.58f);
-            rectAutoStart = new RectangleF(pad, autoTop, ClientSize.Width - pad * 2, autoHeight);
+            rectAutoStart = new RectangleF(pad, autoTop, ClientSize.Width - pad * 2, rowHeight);
+            rectIdlePause = new RectangleF(pad, idleTop, ClientSize.Width - pad * 2, rowHeight);
             rectOpen = new RectangleF(pad, buttonTop, openWidth, buttonHeight);
             rectExit = new RectangleF(pad + openWidth + gap, buttonTop, contentWidth - openWidth, buttonHeight);
         }
@@ -340,6 +382,7 @@ namespace SystemMonitorTray
             DrawHeader(g, textColor, mutedColor);
             DrawCards(g, textColor, mutedColor);
             DrawAutoStart(g, textColor, mutedColor);
+            DrawIdlePause(g, textColor, mutedColor);
             DrawButtons(g);
         }
 
@@ -451,39 +494,52 @@ namespace SystemMonitorTray
 
         private void DrawAutoStart(Graphics g, Color textColor, Color mutedColor)
         {
-            bool rowHover = hover == 3;
+            DrawSwitchRow(g, rectAutoStart, 3, autoStart, "开机自动启动",
+                "登录 Windows 后自动在后台运行", textColor, mutedColor);
+        }
+
+        private void DrawIdlePause(Graphics g, Color textColor, Color mutedColor)
+        {
+            DrawSwitchRow(g, rectIdlePause, 4, idlePause, "空闲时暂停采样",
+                "没人查看约 2 分钟后停止采集，访问时自动恢复", textColor, mutedColor);
+        }
+
+        private void DrawSwitchRow(Graphics g, RectangleF row, int hoverIndex, bool on,
+            string title, string caption, Color textColor, Color mutedColor)
+        {
+            bool rowHover = hover == hoverIndex;
             Color fill = isDark
                 ? (rowHover ? Color.FromArgb(33, 39, 48) : Color.FromArgb(29, 34, 42))
                 : (rowHover ? Color.FromArgb(242, 246, 251) : Color.FromArgb(248, 250, 252));
             Color stroke = isDark ? Color.FromArgb(38, 44, 54) : Color.FromArgb(237, 240, 244);
-            FillRound(g, fill, rectAutoStart, SF(11));
-            using (GraphicsPath path = RoundRect(new RectangleF(rectAutoStart.X + SF(0.5f), rectAutoStart.Y + SF(0.5f), rectAutoStart.Width - SF(1), rectAutoStart.Height - SF(1)), SF(11)))
+            FillRound(g, fill, row, SF(11));
+            using (GraphicsPath path = RoundRect(new RectangleF(row.X + SF(0.5f), row.Y + SF(0.5f), row.Width - SF(1), row.Height - SF(1)), SF(11)))
             using (Pen pen = new Pen(stroke, Math.Max(1f, SF(1))))
                 g.DrawPath(pen, path);
 
-            float innerX = rectAutoStart.X + SF(12);
-            float labelY = rectAutoStart.Y + SF(5);
+            float innerX = row.X + SF(12);
+            float labelY = row.Y + SF(5);
             float labelHeight = fButton.GetHeight(g);
             float trackWidth = SF(40);
-            float trackX = rectAutoStart.Right - SF(12) - trackWidth;
-            DrawText(g, "开机自动启动", fButton,
+            float trackX = row.Right - SF(12) - trackWidth;
+            DrawText(g, title, fButton,
                 new RectangleF(innerX, labelY, trackX - innerX - SF(8), labelHeight + SF(2)), textColor,
                 TextFormatFlags.Left | TextFormatFlags.Top | TextFormatFlags.NoPadding | TextFormatFlags.SingleLine | TextFormatFlags.EndEllipsis);
 
             float captionY = labelY + labelHeight - SF(2);
-            DrawText(g, "登录 Windows 后自动在后台运行", fSub,
+            DrawText(g, caption, fSub,
                 new RectangleF(innerX, captionY, trackX - innerX - SF(8), fSub.GetHeight(g) + SF(2)), mutedColor,
                 TextFormatFlags.Left | TextFormatFlags.Top | TextFormatFlags.NoPadding | TextFormatFlags.SingleLine | TextFormatFlags.EndEllipsis);
 
             float trackHeight = SF(22);
-            float trackY = rectAutoStart.Y + (rectAutoStart.Height - trackHeight) / 2f;
-            Color track = autoStart
+            float trackY = row.Y + (row.Height - trackHeight) / 2f;
+            Color track = on
                 ? (isDark ? Color.FromArgb(96, 165, 250) : Color.FromArgb(59, 130, 246))
                 : (isDark ? Color.FromArgb(55, 62, 74) : Color.FromArgb(209, 216, 226));
             FillRound(g, track, new RectangleF(trackX, trackY, trackWidth, trackHeight), trackHeight / 2f);
 
             float knob = trackHeight - SF(4);
-            float knobX = autoStart ? trackX + trackWidth - knob - SF(2) : trackX + SF(2);
+            float knobX = on ? trackX + trackWidth - knob - SF(2) : trackX + SF(2);
             FillEllipse(g, Color.White, new RectangleF(knobX, trackY + SF(2), knob, knob));
         }
 
@@ -637,10 +693,20 @@ namespace SystemMonitorTray
             base.Dispose(disposing);
         }
 
+        // 1=打开页面 2=结束进程 3=开机启动 4=空闲暂停采样
+        private int HitIndex(System.Drawing.Point p)
+        {
+            if (rectOpen.Contains(p)) return 1;
+            if (rectExit.Contains(p)) return 2;
+            if (rectAutoStart.Contains(p)) return 3;
+            if (rectIdlePause.Contains(p)) return 4;
+            return 0;
+        }
+
         protected override void OnMouseMove(MouseEventArgs e)
         {
             base.OnMouseMove(e);
-            int next = rectOpen.Contains(e.Location) ? 1 : (rectExit.Contains(e.Location) ? 2 : (rectAutoStart.Contains(e.Location) ? 3 : 0));
+            int next = HitIndex(e.Location);
             if (next != hover)
             {
                 hover = next;
@@ -665,7 +731,7 @@ namespace SystemMonitorTray
             base.OnMouseDown(e);
             if (e.Button == MouseButtons.Left)
             {
-                pressed = rectOpen.Contains(e.Location) ? 1 : (rectExit.Contains(e.Location) ? 2 : (rectAutoStart.Contains(e.Location) ? 3 : 0));
+                pressed = HitIndex(e.Location);
                 Invalidate();
             }
         }
@@ -674,7 +740,7 @@ namespace SystemMonitorTray
         {
             base.OnMouseUp(e);
             if (e.Button != MouseButtons.Left) return;
-            int hit = rectOpen.Contains(e.Location) ? 1 : (rectExit.Contains(e.Location) ? 2 : (rectAutoStart.Contains(e.Location) ? 3 : 0));
+            int hit = HitIndex(e.Location);
             int action = hit == pressed ? hit : 0;
             pressed = 0;
             Invalidate();
@@ -683,6 +749,12 @@ namespace SystemMonitorTray
             {
                 AutoStart = !autoStart;
                 if (AutoStartToggled != null) AutoStartToggled(this, EventArgs.Empty);
+                return;
+            }
+            if (action == 4)
+            {
+                IdlePause = !idlePause;
+                if (IdlePauseToggled != null) IdlePauseToggled(this, EventArgs.Empty);
                 return;
             }
             Hide();
@@ -732,6 +804,16 @@ namespace SystemMonitorTray
 
 Add-Type -TypeDefinition $uiSource -ReferencedAssemblies 'System.Windows.Forms.dll', 'System.Drawing.dll' -ErrorAction Stop
 [SystemMonitorTray.NativeDpi]::EnableDpiAwareness()
+
+function Get-JsonUtf8 {
+  param(
+    [Parameter(Mandatory = $true)][string]$Uri,
+    [int]$TimeoutSec = 3
+  )
+  $response = Invoke-WebRequest -Uri $Uri -TimeoutSec $TimeoutSec -UseBasicParsing
+  $bytes = $response.RawContentStream.ToArray()
+  [Text.Encoding]::UTF8.GetString($bytes) | ConvertFrom-Json
+}
 
 function Stop-Server {
   $proc = Get-CimInstance Win32_Process -Filter "ProcessId=$ServerPid" -ErrorAction SilentlyContinue
@@ -790,6 +872,34 @@ function Set-AutoStartEnabled([bool]$enabled) {
   }
 }
 
+# 采样策略由服务端保存在 settings.json 里，托盘只负责读和写：
+# 服务重启后仍然保持上一次的选择。读取失败（比如服务刚重启）时按默认值"开启"显示。
+function Get-SamplerIdlePause {
+  try {
+    $settings = Get-JsonUtf8 -Uri ($Url + '/api/settings') -TimeoutSec 2
+    if ($null -eq $settings) { return $true }
+    return [bool]$settings.samplerIdlePause
+  } catch {
+    return $true
+  }
+}
+
+function Set-SamplerIdlePause([bool]$enabled) {
+  $body = '{"samplerIdlePause":' + $(if ($enabled) { 'true' } else { 'false' }) + '}'
+  $tmp = Join-Path $env:TEMP ('sm-tray-settings-' + $ServerPid + '.json')
+  try {
+    [IO.File]::WriteAllText($tmp, $body, (New-Object Text.UTF8Encoding($false)))
+    $raw = & curl.exe -s -X POST -H 'Content-Type: application/json' --data-binary ('@' + $tmp) ($Url + '/api/settings')
+    if ($LASTEXITCODE -ne 0) { throw ("curl 退出码 " + $LASTEXITCODE) }
+    if ([string]::IsNullOrWhiteSpace($raw)) { throw '服务没有响应' }
+    $parsed = $raw | ConvertFrom-Json
+    if ($null -eq $parsed.samplerIdlePause) { throw '响应格式不正确' }
+    return [bool]$parsed.samplerIdlePause
+  } finally {
+    Remove-Item -LiteralPath $tmp -Force -ErrorAction SilentlyContinue
+  }
+}
+
 function New-TrayIconBitmap([int]$size) {
   $bmp = New-Object System.Drawing.Bitmap($size, $size, [System.Drawing.Imaging.PixelFormat]::Format32bppArgb)
   $gfx = [System.Drawing.Graphics]::FromImage($bmp)
@@ -835,7 +945,7 @@ function Get-PopupMetrics {
 
   $metrics = $null
   try {
-    $metrics = Invoke-RestMethod -Uri ($Url + '/api/metrics') -TimeoutSec 2 -UseBasicParsing
+    $metrics = Get-JsonUtf8 -Uri ($Url + '/api/metrics') -TimeoutSec 2
   } catch {}
 
   if (-not $metrics) {
@@ -914,7 +1024,7 @@ function Get-PopupMetrics {
 
 $sysInfo = $null
 try {
-  $sysInfo = Invoke-RestMethod -Uri ($Url + '/api/system-info') -TimeoutSec 3 -UseBasicParsing
+  $sysInfo = Get-JsonUtf8 -Uri ($Url + '/api/system-info') -TimeoutSec 3
 } catch {}
 
 $script:subtitle = '实时性能监控'
@@ -969,6 +1079,8 @@ $watch.add_Tick({
 function Show-Popup {
   $popup.IsDark = Get-SystemThemeDark
   $popup.AutoStart = Get-AutoStartEnabled
+  # 先取回开关状态再显示，避免面板上出现"先亮后灭"的跳变。
+  $popup.IdlePause = Get-SamplerIdlePause
   $popup.ShowNearCursor()
   $popup.SetMetrics((Get-PopupMetrics))
   $refresh.Start()
@@ -1008,6 +1120,19 @@ $popup.add_AutoStartToggled({
     $popup.AutoStart = Get-AutoStartEnabled
     [void][System.Windows.Forms.MessageBox]::Show(
       ("无法修改开机启动设置：`n" + $_.Exception.Message),
+      '系统监控',
+      [System.Windows.Forms.MessageBoxButtons]::OK,
+      [System.Windows.Forms.MessageBoxIcon]::Warning)
+  }
+})
+
+$popup.add_IdlePauseToggled({
+  try {
+    $popup.IdlePause = Set-SamplerIdlePause ([bool]$popup.IdlePause)
+  } catch {
+    $popup.IdlePause = Get-SamplerIdlePause
+    [void][System.Windows.Forms.MessageBox]::Show(
+      ("无法修改采样设置：`n" + $_.Exception.Message),
       '系统监控',
       [System.Windows.Forms.MessageBoxButtons]::OK,
       [System.Windows.Forms.MessageBoxIcon]::Warning)

@@ -29,6 +29,12 @@
     <div class="topbar-right">
       <span id="os-info" class="muted"></span>
       <span id="clock" class="clock num"></span>
+      <select id="poll-interval" class="poll-select" aria-label="页面刷新频率" title="页面刷新频率">
+        <option value="1" data-i18n="poll1s">1 秒</option>
+        <option value="2" data-i18n="poll2s">2 秒</option>
+        <option value="5" data-i18n="poll5s">5 秒</option>
+        <option value="10" data-i18n="poll10s">10 秒</option>
+      </select>
       <button type="button" class="lang-toggle" id="lang-toggle" title="Switch to English" aria-label="Switch to English">EN</button>
       <button type="button" class="theme-toggle" id="theme-toggle" title="切换到暗黑模式" aria-label="切换到暗黑模式" aria-pressed="false">
         <svg class="icon-sun" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" aria-hidden="true">

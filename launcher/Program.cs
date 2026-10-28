@@ -16,9 +16,12 @@ namespace SystemMonitorLauncher
     internal static class Program
     {
         private const string AppTitle = "系统监控";
-        private const string AppUrl = "http://127.0.0.1:3000/";
-        private const string MetricsUrl = "http://127.0.0.1:3000/api/metrics";
-        private const int AppPort = 3000;
+        private const int DefaultPort = 3000;
+        private const string PortEnvVar = "SM_PORT";
+
+        private static string AppUrl { get { return "http://127.0.0.1:" + appPort + "/"; } }
+        private static string MetricsUrl { get { return "http://127.0.0.1:" + appPort + "/api/metrics"; } }
+        private static int appPort = DefaultPort;
 
         private const uint GenericRead = 0x80000000;
         private const uint GenericWrite = 0x40000000;
@@ -38,8 +41,10 @@ namespace SystemMonitorLauncher
         private static int Main(string[] args)
         {
             bool stop = false;
-            foreach (string arg in args)
+            int cliPort = 0;
+            for (int i = 0; i < args.Length; i++)
             {
+                string arg = args[i];
                 if (string.Equals(arg, "--stop", StringComparison.OrdinalIgnoreCase) ||
                     string.Equals(arg, "/stop", StringComparison.OrdinalIgnoreCase))
                 {
@@ -50,8 +55,18 @@ namespace SystemMonitorLauncher
                 {
                     silent = true;
                 }
+                else if (arg.StartsWith("--port=", StringComparison.OrdinalIgnoreCase))
+                {
+                    cliPort = ParsePort(arg.Substring("--port=".Length), 0);
+                }
+                else if (string.Equals(arg, "--port", StringComparison.OrdinalIgnoreCase) &&
+                         i + 1 < args.Length)
+                {
+                    cliPort = ParsePort(args[i + 1], 0);
+                }
             }
 
+            appPort = ResolvePort(cliPort);
             appDir = ResolveAppDir();
 
             using (Mutex mutex = new Mutex(false, "Local\\SystemMonitorLauncher"))
@@ -99,7 +114,8 @@ namespace SystemMonitorLauncher
                     if (!silent) OpenBrowser();
                     return 0;
                 }
-                Fail("端口 3000 已被其他程序占用，系统监控无法启动。\n请关闭占用该端口的程序后重试。");
+                Fail("端口 " + appPort + " 已被其他程序占用，系统监控无法启动。\n" +
+                    "请关闭占用该端口的程序，或改用其他端口：node port.js set <端口>");
                 return 2;
             }
 
@@ -143,6 +159,57 @@ namespace SystemMonitorLauncher
                 return parent.FullName;
 
             return exeDir;
+        }
+
+        // 与 server.js 的 port.js 保持一致：--port > SM_PORT > %LOCALAPPDATA%\SystemMonitor\port.txt > 3000
+        private static int ResolvePort(int cliPort)
+        {
+            if (cliPort > 0) return cliPort;
+
+            int fromEnv = ParsePort(Environment.GetEnvironmentVariable(PortEnvVar), 0);
+            if (fromEnv > 0) return fromEnv;
+
+            try
+            {
+                string path = PortConfigPath();
+                if (File.Exists(path))
+                {
+                    string firstLine = null;
+                    using (StreamReader reader = new StreamReader(path, Encoding.UTF8))
+                    {
+                        firstLine = reader.ReadLine();
+                    }
+                    int fromFile = ParsePort(firstLine, 0);
+                    if (fromFile > 0) return fromFile;
+                }
+            }
+            catch (Exception ex)
+            {
+                Log("Failed to read port config: " + ex.Message);
+            }
+
+            return DefaultPort;
+        }
+
+        private static string PortConfigPath()
+        {
+            string overrideDir = Environment.GetEnvironmentVariable("SYSTEM_MONITOR_DATA_DIR");
+            if (!string.IsNullOrEmpty(overrideDir)) return Path.Combine(overrideDir, "port.txt");
+
+            string localAppData = Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData);
+            if (string.IsNullOrEmpty(localAppData))
+                localAppData = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.UserProfile),
+                    "AppData", "Local");
+            return Path.Combine(localAppData, "SystemMonitor", "port.txt");
+        }
+
+        private static int ParsePort(string raw, int fallback)
+        {
+            if (string.IsNullOrEmpty(raw)) return fallback;
+            int value;
+            if (!int.TryParse(raw.Trim(), out value)) return fallback;
+            if (value < 1 || value > 65535) return fallback;
+            return value;
         }
 
         private static string ResolveNode()
@@ -214,7 +281,8 @@ namespace SystemMonitorLauncher
 
                 StringBuilder commandLine = new StringBuilder();
                 commandLine.Append('"').Append(nodePath).Append("\" \"")
-                    .Append(serverScript).Append('"');
+                    .Append(serverScript).Append('"')
+                    .Append(" --port ").Append(appPort);
 
                 PROCESS_INFORMATION processInfo;
                 bool started = CreateProcess(
@@ -279,7 +347,7 @@ namespace SystemMonitorLauncher
             {
                 using (TcpClient client = new TcpClient())
                 {
-                    IAsyncResult result = client.BeginConnect(IPAddress.Loopback, AppPort, null, null);
+                    IAsyncResult result = client.BeginConnect(IPAddress.Loopback, appPort, null, null);
                     bool connected = result.AsyncWaitHandle.WaitOne(400);
                     if (!connected) return false;
                     try
